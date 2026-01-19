@@ -1,673 +1,305 @@
 """
-Text-to-Speech Layer
-====================
-Pure text-to-audio conversion using Google Cloud Text-to-Speech.
-Streaming output with cancellation support for barge-in scenarios.
+Text-to-Speech Layer (Streaming)
+=================================
+Real-time streaming text-to-speech using Google Cloud Text-to-Speech.
+Supports barge-in, chunked audio output, and low latency.
 """
 
 import os
 import asyncio
-from typing import Optional, AsyncGenerator, Dict, Any
-from google.cloud import texttospeech_v1 as texttospeech
+import logging
+from typing import Dict, Any, Optional, AsyncGenerator
+from google.cloud import texttospeech
 from google.oauth2 import service_account
-from google.api_core import exceptions as google_exceptions
-import base64
+import json
 
 
-# ============================================================================
-# VOICE LIBRARY
-# ============================================================================
+logger = logging.getLogger(__name__)
+
 
 VOICE_LIBRARY = {
     "en": {
         "language_code": "en-US",
-        "name": "en-US-Neural2-F",  # Female voice, natural
-        "ssml_gender": texttospeech.SsmlVoiceGender.FEMALE
+        "name": "en-US-Neural2-F",
+        "gender": texttospeech.SsmlVoiceGender.FEMALE
     },
     "ar": {
         "language_code": "ar-XA",
-        "name": "ar-XA-Standard-A",  # Female voice
-        "ssml_gender": texttospeech.SsmlVoiceGender.FEMALE
+        "name": "ar-XA-Standard-A",
+        "gender": texttospeech.SsmlVoiceGender.FEMALE
     },
     "es": {
         "language_code": "es-ES",
-        "name": "es-ES-Neural2-A",  # Female voice, natural
-        "ssml_gender": texttospeech.SsmlVoiceGender.FEMALE
+        "name": "es-ES-Neural2-A",
+        "gender": texttospeech.SsmlVoiceGender.FEMALE
     }
 }
 
-# Audio configuration
-AUDIO_ENCODING = texttospeech.AudioEncoding.LINEAR16
-SAMPLE_RATE = 16000  # Hz (phone quality)
-SPEAKING_RATE = 1.0  # Normal speed
-PITCH = 0.0  # Normal pitch
+AUDIO_CONFIG = {
+    "audio_encoding": texttospeech.AudioEncoding.LINEAR16,
+    "sample_rate_hertz": 16000,
+    "speaking_rate": 1.0,
+    "pitch": 0.0,
+    "volume_gain_db": 0.0
+}
 
-# Streaming configuration
-CHUNK_SIZE = 4096  # Bytes per chunk for streaming
-DEFAULT_LANGUAGE = "en"
+CHUNK_SIZE = 4096
 
 
-# ============================================================================
-# CLIENT INITIALIZATION
-# ============================================================================
-
-def _get_credentials() -> Optional[service_account.Credentials]:
-    """
-    Get Google Cloud credentials from environment.
+class CancellationToken:
+    """Token for cancelling TTS mid-stream."""
     
-    Returns:
-        Service account credentials or None (uses default)
-        
-    Environment variables checked:
-    - GOOGLE_APPLICATION_CREDENTIALS (path to JSON key file)
-    - GOOGLE_CLOUD_CREDENTIALS_JSON (JSON string)
-    """
-    # Method 1: Path to credentials file
+    def __init__(self):
+        self._cancelled = False
+        self._event = asyncio.Event()
+    
+    async def cancel(self):
+        """Cancel the TTS operation."""
+        self._cancelled = True
+        self._event.set()
+    
+    def is_cancelled(self) -> bool:
+        """Check if cancelled."""
+        return self._cancelled
+    
+    async def wait_cancelled(self, timeout: float = 0.01):
+        """Wait for cancellation with timeout."""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+
+def _get_credentials():
+    """Get Google Cloud credentials."""
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         return service_account.Credentials.from_service_account_file(creds_path)
     
-    # Method 2: JSON string in environment
     creds_json = os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")
     if creds_json:
-        import json
         creds_dict = json.loads(creds_json)
         return service_account.Credentials.from_service_account_info(creds_dict)
     
-    # Method 3: Use default credentials (for GCP environments)
     return None
 
 
-def _create_client() -> texttospeech.TextToSpeechClient:
-    """
-    Create Google Cloud TTS client.
-    
-    Returns:
-        Initialized TextToSpeechClient
-        
-    Raises:
-        RuntimeError: If credentials cannot be loaded
-    """
-    try:
-        credentials = _get_credentials()
-        if credentials:
-            return texttospeech.TextToSpeechClient(credentials=credentials)
-        else:
-            # Use application default credentials (works in GCP)
-            return texttospeech.TextToSpeechClient()
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to initialize Google Cloud TTS client: {str(e)}. "
-            f"Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON"
-        )
+def _create_client() -> texttospeech.TextToSpeechAsyncClient:
+    """Create Google Cloud TTS client."""
+    credentials = _get_credentials()
+    if credentials:
+        return texttospeech.TextToSpeechAsyncClient(credentials=credentials)
+    return texttospeech.TextToSpeechAsyncClient()
 
 
-# Global client instance (lazy-loaded)
-_client: Optional[texttospeech.TextToSpeechClient] = None
+_client: Optional[texttospeech.TextToSpeechAsyncClient] = None
 
 
-def _get_client() -> texttospeech.TextToSpeechClient:
-    """Get or create the global TTS client."""
+def _get_client() -> texttospeech.TextToSpeechAsyncClient:
+    """Get or create TTS client."""
     global _client
     if _client is None:
         _client = _create_client()
     return _client
 
 
-# ============================================================================
-# CANCELLATION TOKEN
-# ============================================================================
-
-class CancellationToken:
-    """
-    Token for cancelling TTS streaming.
-    Supports barge-in scenarios where user interrupts.
-    """
-    
-    def __init__(self):
-        self._cancelled = False
-        self._lock = asyncio.Lock()
-    
-    async def cancel(self):
-        """Mark this token as cancelled."""
-        async with self._lock:
-            self._cancelled = True
-    
-    async def is_cancelled(self) -> bool:
-        """Check if cancelled."""
-        async with self._lock:
-            return self._cancelled
-    
-    def reset(self):
-        """Reset cancellation state."""
-        self._cancelled = False
-
-
-# ============================================================================
-# CORE TTS FUNCTION
-# ============================================================================
-
 async def stream_tts(
     text: str,
     language_code: str,
-    websocket: Any,
-    cancellation_token: Optional[CancellationToken] = None,
-    speaking_rate: float = SPEAKING_RATE,
-    pitch: float = PITCH,
-    volume_gain_db: float = 0.0
+    websocket,
+    call_id: str,
+    cancel_event: Optional[CancellationToken] = None
 ) -> bool:
     """
-    Stream text-to-speech audio to a WebSocket.
-    
-    Args:
-        text: Text to convert to speech
-        language_code: Language code ('en', 'ar', 'es')
-        websocket: WebSocket connection to stream audio to
-        cancellation_token: Optional token for mid-stream cancellation
-        speaking_rate: Speech rate (0.25 to 4.0, default 1.0)
-        pitch: Voice pitch (-20.0 to 20.0, default 0.0)
-        volume_gain_db: Volume adjustment in dB (-96.0 to 16.0, default 0.0)
-        
-    Returns:
-        True if completed successfully, False if cancelled
-        
-    Raises:
-        ValueError: If text is empty or language unsupported
-        RuntimeError: If TTS generation fails
-        
-    Example:
-        >>> token = CancellationToken()
-        >>> success = await stream_tts("Hello!", "en", ws, token)
-        >>> if success:
-        >>>     print("Speech completed")
-    """
-    # Validate input
-    if not text or text.strip() == "":
-        raise ValueError("Text cannot be empty")
-    
-    if language_code not in VOICE_LIBRARY:
-        raise ValueError(
-            f"Unsupported language: {language_code}. "
-            f"Supported: {list(VOICE_LIBRARY.keys())}"
-        )
-    
-    # Get voice configuration
-    voice_config = VOICE_LIBRARY[language_code]
-    
-    try:
-        # Generate audio
-        audio_content = await _synthesize_speech(
-            text=text,
-            voice_config=voice_config,
-            speaking_rate=speaking_rate,
-            pitch=pitch,
-            volume_gain_db=volume_gain_db
-        )
-        
-        # Stream audio in chunks
-        return await _stream_audio_chunks(
-            audio_content=audio_content,
-            websocket=websocket,
-            cancellation_token=cancellation_token
-        )
-        
-    except google_exceptions.InvalidArgument as e:
-        raise ValueError(f"Invalid TTS parameters: {str(e)}")
-    except google_exceptions.GoogleAPIError as e:
-        raise RuntimeError(f"Google Cloud API error: {str(e)}")
-    except Exception as e:
-        raise RuntimeError(f"TTS streaming failed: {str(e)}")
-
-
-# ============================================================================
-# AUDIO GENERATION
-# ============================================================================
-
-async def _synthesize_speech(
-    text: str,
-    voice_config: Dict[str, Any],
-    speaking_rate: float,
-    pitch: float,
-    volume_gain_db: float
-) -> bytes:
-    """
-    Synthesize speech from text using Google Cloud TTS.
+    Stream synthesized audio to websocket with barge-in support.
     
     Args:
         text: Text to synthesize
-        voice_config: Voice configuration from VOICE_LIBRARY
-        speaking_rate: Speech rate
-        pitch: Voice pitch
-        volume_gain_db: Volume adjustment
+        language_code: Language code ('en', 'ar', 'es')
+        websocket: WebSocket connection to stream audio
+        call_id: Call identifier for logging
+        cancel_event: Cancellation token for barge-in
         
     Returns:
-        Audio content as bytes
+        True if completed without cancellation, False if cancelled
     """
-    # Build synthesis input
-    synthesis_input = texttospeech.SynthesisInput(text=text)
+    if not text or not text.strip():
+        return True
     
-    # Build voice parameters
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=voice_config["language_code"],
-        name=voice_config["name"],
-        ssml_gender=voice_config["ssml_gender"]
-    )
+    if cancel_event is None:
+        cancel_event = CancellationToken()
     
-    # Build audio config
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=AUDIO_ENCODING,
-        sample_rate_hertz=SAMPLE_RATE,
-        speaking_rate=speaking_rate,
-        pitch=pitch,
-        volume_gain_db=volume_gain_db,
-        # Additional quality settings
-        effects_profile_id=["telephony-class-application"],  # Optimized for phone
-    )
-    
-    # Perform synthesis (blocking call, run in executor)
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: _get_client().synthesize_speech(
+    try:
+        voice_config = VOICE_LIBRARY.get(language_code, VOICE_LIBRARY["en"])
+        
+        client = _get_client()
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=voice_config["language_code"],
+            name=voice_config["name"],
+            ssml_gender=voice_config["gender"]
+        )
+        
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=AUDIO_CONFIG["audio_encoding"],
+            sample_rate_hertz=AUDIO_CONFIG["sample_rate_hertz"],
+            speaking_rate=AUDIO_CONFIG["speaking_rate"],
+            pitch=AUDIO_CONFIG["pitch"],
+            volume_gain_db=AUDIO_CONFIG["volume_gain_db"]
+        )
+        
+        response = await client.synthesize_speech(
             input=synthesis_input,
             voice=voice,
             audio_config=audio_config
         )
-    )
-    
-    return response.audio_content
-
-
-# ============================================================================
-# AUDIO STREAMING
-# ============================================================================
-
-async def _stream_audio_chunks(
-    audio_content: bytes,
-    websocket: Any,
-    cancellation_token: Optional[CancellationToken] = None,
-    chunk_size: int = CHUNK_SIZE
-) -> bool:
-    """
-    Stream audio content in chunks to WebSocket.
-    
-    Args:
-        audio_content: Audio bytes to stream
-        websocket: WebSocket connection
-        cancellation_token: Optional cancellation token
-        chunk_size: Size of each chunk in bytes
         
-    Returns:
-        True if completed, False if cancelled
-    """
-    total_size = len(audio_content)
-    offset = 0
-    
-    while offset < total_size:
-        # Check for cancellation
-        if cancellation_token and await cancellation_token.is_cancelled():
-            return False
+        audio_content = response.audio_content
         
-        # Get next chunk
-        chunk = audio_content[offset:offset + chunk_size]
+        if not audio_content:
+            logger.warning(f"Empty audio generated for call {call_id}")
+            return True
         
-        # Send chunk to WebSocket
-        try:
-            await websocket.send_bytes(chunk)
-        except Exception as e:
-            # WebSocket error - stop streaming
-            raise RuntimeError(f"WebSocket send failed: {str(e)}")
+        total_chunks = (len(audio_content) + CHUNK_SIZE - 1) // CHUNK_SIZE
         
-        offset += chunk_size
+        for i in range(0, len(audio_content), CHUNK_SIZE):
+            if cancel_event.is_cancelled():
+                logger.info(f"TTS cancelled for call {call_id} at chunk {i // CHUNK_SIZE}/{total_chunks}")
+                return False
+            
+            chunk = audio_content[i:i + CHUNK_SIZE]
+            
+            try:
+                await websocket.send_bytes(chunk)
+            except Exception as e:
+                logger.error(f"Failed to send audio chunk for call {call_id}: {str(e)}")
+                return False
+            
+            if await cancel_event.wait_cancelled():
+                logger.info(f"TTS cancelled during send for call {call_id}")
+                return False
         
-        # Small delay to prevent overwhelming the connection
-        # Adjust based on your needs
-        await asyncio.sleep(0.01)
-    
-    return True
+        logger.info(f"TTS completed for call {call_id}: {len(text)} chars, {total_chunks} chunks")
+        return True
+        
+    except asyncio.CancelledError:
+        logger.info(f"TTS task cancelled for call {call_id}")
+        return False
+    except Exception as e:
+        logger.error(f"TTS error for call {call_id}: {str(e)}", exc_info=True)
+        return False
 
 
-# ============================================================================
-# GENERATOR-BASED STREAMING (ALTERNATIVE)
-# ============================================================================
-
-async def generate_tts_chunks(
+async def synthesize_speech_streaming(
     text: str,
     language_code: str,
-    speaking_rate: float = SPEAKING_RATE,
-    pitch: float = PITCH,
-    volume_gain_db: float = 0.0,
-    chunk_size: int = CHUNK_SIZE
+    cancel_event: Optional[CancellationToken] = None
 ) -> AsyncGenerator[bytes, None]:
     """
-    Generate TTS audio chunks as an async generator.
-    Alternative to stream_tts for custom streaming logic.
+    Generate audio chunks for streaming.
     
     Args:
-        text: Text to convert to speech
-        language_code: Language code ('en', 'ar', 'es')
-        speaking_rate: Speech rate
-        pitch: Voice pitch
-        volume_gain_db: Volume adjustment
-        chunk_size: Size of each chunk
+        text: Text to synthesize
+        language_code: Language code
+        cancel_event: Cancellation token
         
     Yields:
-        Audio chunks as bytes
-        
-    Raises:
-        ValueError: If text is empty or language unsupported
-        RuntimeError: If TTS generation fails
-        
-    Example:
-        >>> async for chunk in generate_tts_chunks("Hello!", "en"):
-        >>>     await websocket.send_bytes(chunk)
+        Audio chunk bytes
     """
-    # Validate input
-    if not text or text.strip() == "":
-        raise ValueError("Text cannot be empty")
+    if not text or not text.strip():
+        return
     
-    if language_code not in VOICE_LIBRARY:
-        raise ValueError(
-            f"Unsupported language: {language_code}. "
-            f"Supported: {list(VOICE_LIBRARY.keys())}"
+    if cancel_event is None:
+        cancel_event = CancellationToken()
+    
+    try:
+        voice_config = VOICE_LIBRARY.get(language_code, VOICE_LIBRARY["en"])
+        
+        client = _get_client()
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=voice_config["language_code"],
+            name=voice_config["name"],
+            ssml_gender=voice_config["gender"]
         )
-    
-    # Get voice configuration
-    voice_config = VOICE_LIBRARY[language_code]
-    
-    # Generate audio
-    audio_content = await _synthesize_speech(
-        text=text,
-        voice_config=voice_config,
-        speaking_rate=speaking_rate,
-        pitch=pitch,
-        volume_gain_db=volume_gain_db
-    )
-    
-    # Yield chunks
-    offset = 0
-    total_size = len(audio_content)
-    
-    while offset < total_size:
-        chunk = audio_content[offset:offset + chunk_size]
-        yield chunk
-        offset += chunk_size
-
-
-# ============================================================================
-# SSML SUPPORT
-# ============================================================================
-
-async def stream_tts_ssml(
-    ssml: str,
-    language_code: str,
-    websocket: Any,
-    cancellation_token: Optional[CancellationToken] = None,
-    speaking_rate: float = SPEAKING_RATE,
-    pitch: float = PITCH,
-    volume_gain_db: float = 0.0
-) -> bool:
-    """
-    Stream TTS from SSML (Speech Synthesis Markup Language).
-    Allows for advanced control: pauses, emphasis, prosody, etc.
-    
-    Args:
-        ssml: SSML-formatted text
-        language_code: Language code ('en', 'ar', 'es')
-        websocket: WebSocket connection
-        cancellation_token: Optional cancellation token
-        speaking_rate: Speech rate
-        pitch: Voice pitch
-        volume_gain_db: Volume adjustment
         
-    Returns:
-        True if completed, False if cancelled
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=AUDIO_CONFIG["audio_encoding"],
+            sample_rate_hertz=AUDIO_CONFIG["sample_rate_hertz"],
+            speaking_rate=AUDIO_CONFIG["speaking_rate"],
+            pitch=AUDIO_CONFIG["pitch"],
+            volume_gain_db=AUDIO_CONFIG["volume_gain_db"]
+        )
         
-    Example:
-        >>> ssml = '''<speak>
-        >>>     Hello! <break time="500ms"/>
-        >>>     Your order total is <emphasis>$25.99</emphasis>.
-        >>> </speak>'''
-        >>> await stream_tts_ssml(ssml, "en", ws)
-    """
-    if not ssml or ssml.strip() == "":
-        raise ValueError("SSML cannot be empty")
-    
-    if language_code not in VOICE_LIBRARY:
-        raise ValueError(f"Unsupported language: {language_code}")
-    
-    voice_config = VOICE_LIBRARY[language_code]
-    
-    # Build synthesis input with SSML
-    synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
-    
-    # Build voice parameters
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=voice_config["language_code"],
-        name=voice_config["name"],
-        ssml_gender=voice_config["ssml_gender"]
-    )
-    
-    # Build audio config
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=AUDIO_ENCODING,
-        sample_rate_hertz=SAMPLE_RATE,
-        speaking_rate=speaking_rate,
-        pitch=pitch,
-        volume_gain_db=volume_gain_db,
-        effects_profile_id=["telephony-class-application"],
-    )
-    
-    # Synthesize
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: _get_client().synthesize_speech(
+        response = await client.synthesize_speech(
             input=synthesis_input,
             voice=voice,
             audio_config=audio_config
         )
-    )
-    
-    # Stream
-    return await _stream_audio_chunks(
-        audio_content=response.audio_content,
-        websocket=websocket,
-        cancellation_token=cancellation_token
-    )
+        
+        audio_content = response.audio_content
+        
+        for i in range(0, len(audio_content), CHUNK_SIZE):
+            if cancel_event.is_cancelled():
+                break
+            
+            chunk = audio_content[i:i + CHUNK_SIZE]
+            yield chunk
+            
+            await asyncio.sleep(0)
+            
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.error(f"Streaming synthesis error: {str(e)}")
+        return
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
+def get_voice_for_language(language_code: str) -> Dict[str, Any]:
+    """Get voice configuration for language."""
+    return VOICE_LIBRARY.get(language_code, VOICE_LIBRARY["en"])
+
 
 def get_supported_languages() -> list[str]:
-    """
-    Get list of supported language codes.
-    
-    Returns:
-        List of language codes
-        
-    Example:
-        >>> langs = get_supported_languages()
-        >>> print(langs)  # ['en', 'ar', 'es']
-    """
+    """Get list of supported languages."""
     return list(VOICE_LIBRARY.keys())
 
 
-def get_voice_info(language_code: str) -> Dict[str, Any]:
-    """
-    Get voice configuration for a language.
-    
-    Args:
-        language_code: Language code
-        
-    Returns:
-        Voice configuration dictionary
-        
-    Raises:
-        ValueError: If language not supported
-        
-    Example:
-        >>> info = get_voice_info("en")
-        >>> print(info["name"])  # en-US-Neural2-F
-    """
-    if language_code not in VOICE_LIBRARY:
-        raise ValueError(f"Unsupported language: {language_code}")
-    return VOICE_LIBRARY[language_code].copy()
+def update_audio_config(
+    speaking_rate: Optional[float] = None,
+    pitch: Optional[float] = None,
+    volume_gain_db: Optional[float] = None
+):
+    """Update global audio configuration."""
+    if speaking_rate is not None:
+        AUDIO_CONFIG["speaking_rate"] = speaking_rate
+    if pitch is not None:
+        AUDIO_CONFIG["pitch"] = pitch
+    if volume_gain_db is not None:
+        AUDIO_CONFIG["volume_gain_db"] = volume_gain_db
 
-
-def is_language_supported(language_code: str) -> bool:
-    """
-    Check if a language is supported.
-    
-    Args:
-        language_code: Language code to check
-        
-    Returns:
-        True if supported
-        
-    Example:
-        >>> is_language_supported("en")  # True
-        >>> is_language_supported("fr")  # False
-    """
-    return language_code in VOICE_LIBRARY
-
-
-async def synthesize_to_file(
-    text: str,
-    language_code: str,
-    output_path: str,
-    speaking_rate: float = SPEAKING_RATE,
-    pitch: float = PITCH,
-    volume_gain_db: float = 0.0
-) -> str:
-    """
-    Synthesize speech and save to file (for testing/caching).
-    
-    Args:
-        text: Text to synthesize
-        language_code: Language code
-        output_path: Path to save audio file
-        speaking_rate: Speech rate
-        pitch: Voice pitch
-        volume_gain_db: Volume adjustment
-        
-    Returns:
-        Path to saved file
-        
-    Example:
-        >>> path = await synthesize_to_file("Hello!", "en", "hello.wav")
-    """
-    if language_code not in VOICE_LIBRARY:
-        raise ValueError(f"Unsupported language: {language_code}")
-    
-    voice_config = VOICE_LIBRARY[language_code]
-    
-    audio_content = await _synthesize_speech(
-        text=text,
-        voice_config=voice_config,
-        speaking_rate=speaking_rate,
-        pitch=pitch,
-        volume_gain_db=volume_gain_db
-    )
-    
-    # Save to file
-    with open(output_path, "wb") as f:
-        f.write(audio_content)
-    
-    return output_path
-
-
-def create_ssml(
-    text: str,
-    pauses: Optional[list[tuple[int, str]]] = None,
-    emphasis: Optional[list[tuple[int, int]]] = None,
-    rate: str = "medium"
-) -> str:
-    """
-    Helper to create SSML from plain text.
-    
-    Args:
-        text: Base text
-        pauses: List of (char_position, duration) tuples (e.g., "500ms")
-        emphasis: List of (start_pos, end_pos) tuples for emphasis
-        rate: Speaking rate ("x-slow", "slow", "medium", "fast", "x-fast")
-        
-    Returns:
-        SSML string
-        
-    Example:
-        >>> ssml = create_ssml(
-        >>>     "Hello. How are you?",
-        >>>     pauses=[(5, "500ms")],
-        >>>     emphasis=[(11, 19)]
-        >>> )
-    """
-    # Start with prosody for rate
-    ssml = f'<speak><prosody rate="{rate}">'
-    
-    # TODO: Implement insertion of pauses and emphasis
-    # For now, just wrap the text
-    ssml += text
-    
-    ssml += '</prosody></speak>'
-    
-    return ssml
-
-
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
 
 if __name__ == "__main__":
-    """
-    Example usage of the TTS module.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
     async def example():
-        print("TTS Module Example")
+        print("Streaming TTS Example")
         print("=" * 50)
         
-        print("\nSupported languages:", get_supported_languages())
-        
+        print("\nSupported languages:")
         for lang in get_supported_languages():
-            info = get_voice_info(lang)
-            print(f"\n{lang.upper()}:")
-            print(f"  Voice: {info['name']}")
-            print(f"  Language: {info['language_code']}")
-            print(f"  Gender: {info['ssml_gender']}")
+            voice = get_voice_for_language(lang)
+            print(f"  {lang}: {voice['name']}")
         
-        print("\nConfiguration:")
-        print(f"- Sample rate: {SAMPLE_RATE} Hz")
-        print(f"- Encoding: {AUDIO_ENCODING}")
-        print(f"- Chunk size: {CHUNK_SIZE} bytes")
-        print(f"- Default speaking rate: {SPEAKING_RATE}")
-        
-        # Example with mock WebSocket
-        class MockWebSocket:
-            async def send_bytes(self, data: bytes):
-                print(f"  Sent {len(data)} bytes")
-        
-        ws = MockWebSocket()
-        token = CancellationToken()
-        
-        print("\n\nExample TTS streaming:")
-        print("-" * 50)
-        
-        # Simulate streaming
-        # In production, this would stream to a real WebSocket
-        # success = await stream_tts(
-        #     "Hello! Welcome to our restaurant.",
-        #     "en",
-        #     ws,
-        #     token
-        # )
-        
-        print("\nTo use in production:")
-        print("  success = await stream_tts(text, 'en', websocket, token)")
-        print("  if not success:")
-        print("      print('User interrupted (barge-in)')")
+        print("\n" + "=" * 50)
+        print("Streaming TTS ready for production use")
     
-    # Run example
     asyncio.run(example())
