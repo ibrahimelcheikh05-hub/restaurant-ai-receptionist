@@ -1,685 +1,670 @@
 """
-Upsell Intelligence Layer
-==========================
-Smart upsell and cross-sell recommendations.
-Pure logic-based system - no AI, no database writes.
+Upsell Module (Production)
+===========================
+Hardened upsell recommendation engine with non-repeating logic.
+Context-aware, hard caps per call, deterministic outputs, safety filtering.
 """
 
+import logging
 from typing import Dict, List, Any, Optional, Set
-from collections import Counter
+from datetime import datetime
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+logger = logging.getLogger(__name__)
 
-# Common item associations for cross-selling
-CROSS_SELL_RULES = {
-    "pizza": ["drinks", "sides", "desserts"],
-    "burger": ["fries", "drinks", "sides"],
-    "pasta": ["bread", "salad", "drinks"],
-    "sandwich": ["chips", "drinks", "sides"],
-    "salad": ["drinks", "bread", "protein"],
-    "entree": ["appetizers", "sides", "drinks", "desserts"]
+
+# Configuration
+MAX_UPSELLS_PER_CALL = 3
+MAX_UPSELLS_PER_TURN = 1
+MIN_ORDER_VALUE_FOR_UPSELL = 5.00
+MAX_UPSELL_PRICE_RATIO = 0.5  # Upsell price <= 50% of current order
+
+
+# Upsell categories
+UPSELL_CATEGORIES = {
+    "drinks": ["soda", "juice", "water", "tea", "coffee"],
+    "sides": ["fries", "salad", "coleslaw", "breadsticks", "wings"],
+    "desserts": ["cake", "pie", "ice cream", "cookie", "brownie"],
+    "upgrades": ["large", "extra", "premium", "deluxe", "combo"]
 }
 
-# Price-based upsell thresholds
-UPSELL_PRICE_MARGIN = 1.5  # Suggest items up to 1.5x current item price
-UPSELL_MAX_SUGGESTIONS = 5
-CROSS_SELL_MAX_SUGGESTIONS = 3
 
-# Minimum order value for premium upsells
-PREMIUM_UPSELL_THRESHOLD = 20.00
+class UpsellTracker:
+    """
+    Track upsell history per call to prevent repetition.
+    Context-aware recommendation engine.
+    """
+    
+    def __init__(self, call_id: str):
+        """
+        Initialize upsell tracker.
+        
+        Args:
+            call_id: Call identifier
+        """
+        self.call_id = call_id
+        
+        # Tracking sets
+        self.offered_items: Set[str] = set()  # Item IDs offered
+        self.offered_categories: Set[str] = set()  # Categories offered
+        self.accepted_items: Set[str] = set()  # Items customer accepted
+        self.rejected_items: Set[str] = set()  # Items customer rejected
+        
+        # Counters
+        self.total_offered = 0
+        self.total_accepted = 0
+        self.total_rejected = 0
+        
+        # Flags
+        self.upsells_disabled = False
+        self.customer_declined_all = False
+        
+        # Timestamps
+        self.created_at = datetime.utcnow()
+        self.last_offer_time: Optional[datetime] = None
+        
+        logger.debug(f"UpsellTracker created for {call_id}")
+    
+    def can_offer_upsell(self) -> bool:
+        """
+        Check if upsell can be offered.
+        
+        Returns:
+            True if upsell allowed
+        """
+        # Check disabled flag
+        if self.upsells_disabled:
+            logger.debug(f"Upsells disabled for {self.call_id}")
+            return False
+        
+        # Check customer declined all
+        if self.customer_declined_all:
+            logger.debug(f"Customer declined all upsells for {self.call_id}")
+            return False
+        
+        # Check hard cap
+        if self.total_offered >= MAX_UPSELLS_PER_CALL:
+            logger.debug(f"Max upsells reached for {self.call_id}")
+            return False
+        
+        return True
+    
+    def mark_offered(self, item_id: str, category: Optional[str] = None):
+        """
+        Mark item as offered.
+        
+        Args:
+            item_id: Item identifier
+            category: Item category
+        """
+        self.offered_items.add(item_id)
+        if category:
+            self.offered_categories.add(category)
+        
+        self.total_offered += 1
+        self.last_offer_time = datetime.utcnow()
+        
+        logger.debug(f"Upsell offered: {item_id} (total: {self.total_offered})")
+    
+    def mark_accepted(self, item_id: str):
+        """
+        Mark item as accepted.
+        
+        Args:
+            item_id: Item identifier
+        """
+        self.accepted_items.add(item_id)
+        self.total_accepted += 1
+        
+        logger.info(f"Upsell accepted: {item_id} for {self.call_id}")
+    
+    def mark_rejected(self, item_id: str):
+        """
+        Mark item as rejected.
+        
+        Args:
+            item_id: Item identifier
+        """
+        self.rejected_items.add(item_id)
+        self.total_rejected += 1
+        
+        logger.debug(f"Upsell rejected: {item_id}")
+    
+    def mark_declined_all(self):
+        """Mark that customer declined all upsells."""
+        self.customer_declined_all = True
+        logger.info(f"Customer declined all upsells for {self.call_id}")
+    
+    def disable_upsells(self):
+        """Disable upsells for this call."""
+        self.upsells_disabled = True
+        logger.info(f"Upsells disabled for {self.call_id}")
+    
+    def was_offered(self, item_id: str) -> bool:
+        """Check if item was already offered."""
+        return item_id in self.offered_items
+    
+    def was_category_offered(self, category: str) -> bool:
+        """Check if category was already offered."""
+        return category in self.offered_categories
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get upsell statistics."""
+        return {
+            "call_id": self.call_id,
+            "total_offered": self.total_offered,
+            "total_accepted": self.total_accepted,
+            "total_rejected": self.total_rejected,
+            "acceptance_rate": self.total_accepted / max(1, self.total_offered),
+            "upsells_disabled": self.upsells_disabled,
+            "customer_declined_all": self.customer_declined_all
+        }
 
 
-# ============================================================================
-# CORE UPSELL FUNCTION
-# ============================================================================
+# Global tracker store
+_upsell_trackers: Dict[str, UpsellTracker] = {}
+
+
+def _get_tracker(call_id: str) -> UpsellTracker:
+    """
+    Get or create upsell tracker.
+    
+    Args:
+        call_id: Call identifier
+        
+    Returns:
+        UpsellTracker instance
+    """
+    if call_id not in _upsell_trackers:
+        _upsell_trackers[call_id] = UpsellTracker(call_id)
+    
+    return _upsell_trackers[call_id]
+
 
 def suggest_upsells(
+    call_id: str,
     menu: Dict[str, Any],
-    current_order: List[Dict[str, Any]],
-    max_suggestions: int = UPSELL_MAX_SUGGESTIONS
+    current_order: Optional[Dict[str, Any]] = None,
+    max_suggestions: int = MAX_UPSELLS_PER_TURN
 ) -> List[Dict[str, Any]]:
     """
-    Suggest upsell and cross-sell items based on current order.
+    Generate context-aware upsell suggestions.
     
     Args:
-        menu: Menu dictionary from menu.py (with 'items' key)
-        current_order: List of items currently in order
-        max_suggestions: Maximum number of suggestions to return
+        call_id: Call identifier
+        menu: Menu data
+        current_order: Current order data (optional)
+        max_suggestions: Maximum suggestions to return
         
     Returns:
-        List of suggested items, ranked by relevance
-        Each suggestion includes:
-        - item: Menu item dictionary
-        - reason: Why this is suggested
-        - type: 'upsell' or 'cross-sell'
-        - score: Relevance score (higher = more relevant)
+        List of upsell suggestions
         
     Example:
-        >>> suggestions = suggest_upsells(menu, current_order)
-        >>> for s in suggestions:
-        >>>     print(f"{s['item']['name']}: {s['reason']}")
+        >>> suggestions = suggest_upsells("call_123", menu, order)
+        >>> for sug in suggestions:
+        >>>     print(sug["name"], sug["reason"])
     """
-    # Validate input
-    if not menu or not menu.get("items"):
+    tracker = _get_tracker(call_id)
+    
+    # Check if upsells allowed
+    if not tracker.can_offer_upsell():
         return []
     
-    if not current_order:
-        # No items yet - suggest popular or featured items
-        return _suggest_initial_items(menu, max_suggestions)
+    if not menu or not menu.get("items"):
+        logger.warning(f"No menu available for upsells: {call_id}")
+        return []
     
-    # Get all menu items
-    all_items = menu["items"]
+    # Get current order context
+    current_items = []
+    current_total = 0.0
     
-    # Get items already in order (to avoid duplicates)
-    order_item_ids = {item["item_id"] for item in current_order}
+    if current_order and current_order.get("items"):
+        current_items = current_order["items"]
+        current_total = current_order.get("total", 0.0)
     
-    # Calculate order statistics
-    order_stats = _calculate_order_stats(current_order)
+    # Check minimum order value
+    if current_total < MIN_ORDER_VALUE_FOR_UPSELL:
+        logger.debug(f"Order value too low for upsells: ${current_total:.2f}")
+        return []
     
-    # Generate suggestions
-    suggestions = []
+    # Determine what's missing
+    missing_categories = _get_missing_categories(current_items)
     
-    # 1. Cross-sell suggestions (complementary items)
-    cross_sells = _generate_cross_sell_suggestions(
-        all_items,
-        current_order,
-        order_item_ids,
-        order_stats
+    # Generate candidates
+    candidates = _generate_candidates(
+        menu,
+        current_items,
+        current_total,
+        missing_categories,
+        tracker
     )
-    suggestions.extend(cross_sells)
     
-    # 2. Upsell suggestions (premium versions)
-    upsells = _generate_upsell_suggestions(
-        all_items,
-        current_order,
-        order_item_ids,
-        order_stats
+    # Filter and rank
+    filtered = _filter_candidates(candidates, tracker)
+    ranked = _rank_candidates(filtered, current_total)
+    
+    # Limit to max suggestions
+    suggestions = ranked[:max_suggestions]
+    
+    # Mark as offered
+    for suggestion in suggestions:
+        tracker.mark_offered(
+            suggestion["item_id"],
+            suggestion.get("category")
+        )
+    
+    logger.info(
+        f"Generated {len(suggestions)} upsell(s) for {call_id}: "
+        f"{[s['name'] for s in suggestions]}"
     )
-    suggestions.extend(upsells)
     
-    # 3. Category completion (missing categories)
-    category_suggestions = _generate_category_suggestions(
-        all_items,
-        current_order,
-        order_item_ids,
-        order_stats
-    )
-    suggestions.extend(category_suggestions)
-    
-    # 4. Value-based suggestions (combos, deals)
-    value_suggestions = _generate_value_suggestions(
-        all_items,
-        current_order,
-        order_item_ids,
-        order_stats
-    )
-    suggestions.extend(value_suggestions)
-    
-    # Rank suggestions by score
-    suggestions.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Return top suggestions
-    return suggestions[:max_suggestions]
+    return suggestions
 
 
-# ============================================================================
-# SUGGESTION GENERATORS
-# ============================================================================
+def _get_missing_categories(current_items: List[Dict[str, Any]]) -> Set[str]:
+    """
+    Determine which categories are missing from order.
+    
+    Args:
+        current_items: Current order items
+        
+    Returns:
+        Set of missing categories
+    """
+    present_categories = set()
+    
+    for item in current_items:
+        category = item.get("category", "").lower()
+        
+        # Map to upsell categories
+        for upsell_cat, keywords in UPSELL_CATEGORIES.items():
+            if any(kw in category for kw in keywords):
+                present_categories.add(upsell_cat)
+    
+    # Return missing categories
+    all_categories = set(UPSELL_CATEGORIES.keys())
+    missing = all_categories - present_categories
+    
+    return missing
 
-def _generate_cross_sell_suggestions(
-    all_items: List[Dict[str, Any]],
-    current_order: List[Dict[str, Any]],
-    order_item_ids: Set[str],
-    order_stats: Dict[str, Any]
+
+def _generate_candidates(
+    menu: Dict[str, Any],
+    current_items: List[Dict[str, Any]],
+    current_total: float,
+    missing_categories: Set[str],
+    tracker: UpsellTracker
 ) -> List[Dict[str, Any]]:
     """
-    Generate cross-sell suggestions (complementary items).
-    """
-    suggestions = []
+    Generate upsell candidates.
     
-    # Get categories in current order
-    order_categories = {
-        item.get("category", "").lower()
-        for item in current_order
-    }
-    
-    # Determine what categories to suggest
-    suggested_categories = set()
-    for order_cat in order_categories:
-        # Check cross-sell rules
-        for rule_key, cross_sell_cats in CROSS_SELL_RULES.items():
-            if rule_key in order_cat:
-                suggested_categories.update(cross_sell_cats)
-    
-    # Find items in suggested categories
-    for item in all_items:
-        if item["id"] in order_item_ids:
-            continue  # Skip items already in order
+    Args:
+        menu: Menu data
+        current_items: Current order items
+        current_total: Current order total
+        missing_categories: Categories not in order
+        tracker: Upsell tracker
         
+    Returns:
+        List of candidate upsells
+    """
+    candidates = []
+    max_upsell_price = current_total * MAX_UPSELL_PRICE_RATIO
+    
+    for item in menu.get("items", []):
+        # Skip if unavailable
+        if not item.get("available", True):
+            continue
+        
+        item_id = item.get("id", "")
+        item_name = item.get("name", "")
+        item_price = item.get("price", 0.0)
         item_category = item.get("category", "").lower()
         
-        # Check if item matches suggested categories
-        for suggested_cat in suggested_categories:
-            if suggested_cat in item_category:
-                suggestions.append({
-                    "item": item,
-                    "reason": f"Pairs well with your {list(order_categories)[0]}",
-                    "type": "cross-sell",
-                    "score": 8.0  # High relevance
-                })
-                break
-    
-    return suggestions
-
-
-def _generate_upsell_suggestions(
-    all_items: List[Dict[str, Any]],
-    current_order: List[Dict[str, Any]],
-    order_item_ids: Set[str],
-    order_stats: Dict[str, Any]
-) -> List[Dict[str, Any]]:
-    """
-    Generate upsell suggestions (premium versions of current items).
-    """
-    suggestions = []
-    
-    # For each item in order, find premium alternatives
-    for order_item in current_order:
-        order_item_name = order_item.get("name", "").lower()
-        order_item_category = order_item.get("category", "").lower()
-        order_item_price = order_item.get("price", 0.0)
+        # Skip if already in order
+        if any(i.get("id") == item_id for i in current_items):
+            continue
         
-        # Find items in same category with higher price
-        for menu_item in all_items:
-            if menu_item["id"] in order_item_ids:
-                continue
-            
-            menu_category = menu_item.get("category", "").lower()
-            menu_price = menu_item.get("price", 0.0)
-            
-            # Must be same category
-            if menu_category != order_item_category:
-                continue
-            
-            # Must be more expensive (but not too much)
-            if menu_price <= order_item_price:
-                continue
-            
-            if menu_price > order_item_price * UPSELL_PRICE_MARGIN:
-                continue
-            
-            # Calculate price difference
-            price_diff = menu_price - order_item_price
-            
-            suggestions.append({
-                "item": menu_item,
-                "reason": f"Premium upgrade (+${price_diff:.2f})",
-                "type": "upsell",
-                "score": 7.0  # Good relevance
-            })
-    
-    return suggestions
-
-
-def _generate_category_suggestions(
-    all_items: List[Dict[str, Any]],
-    current_order: List[Dict[str, Any]],
-    order_item_ids: Set[str],
-    order_stats: Dict[str, Any]
-) -> List[Dict[str, Any]]:
-    """
-    Suggest items from missing categories to complete the meal.
-    """
-    suggestions = []
-    
-    # Categories in order
-    order_categories = {
-        item.get("category", "").lower()
-        for item in current_order
-    }
-    
-    # All available categories
-    all_categories = {
-        item.get("category", "").lower()
-        for item in all_items
-    }
-    
-    # Missing categories
-    missing_categories = all_categories - order_categories
-    
-    # Common meal completion categories
-    completion_categories = ["drinks", "desserts", "sides", "appetizers"]
-    
-    for cat in completion_categories:
-        if any(cat in missing_cat for missing_cat in missing_categories):
-            # Find items in this category
-            for item in all_items:
-                if item["id"] in order_item_ids:
-                    continue
-                
-                item_cat = item.get("category", "").lower()
-                if cat in item_cat:
-                    suggestions.append({
-                        "item": item,
-                        "reason": f"Complete your meal with a {cat.rstrip('s')}",
-                        "type": "cross-sell",
-                        "score": 6.0  # Moderate relevance
-                    })
-                    break  # One per category
-    
-    return suggestions
-
-
-def _generate_value_suggestions(
-    all_items: List[Dict[str, Any]],
-    current_order: List[Dict[str, Any]],
-    order_item_ids: Set[str],
-    order_stats: Dict[str, Any]
-) -> List[Dict[str, Any]]:
-    """
-    Suggest value items (affordable additions).
-    """
-    suggestions = []
-    
-    # Order total
-    order_total = order_stats["total_value"]
-    
-    # If order is small, suggest affordable items
-    if order_total < PREMIUM_UPSELL_THRESHOLD:
-        # Find low-price items
-        affordable_items = [
-            item for item in all_items
-            if item["id"] not in order_item_ids
-            and item.get("price", 999) < 5.00
-        ]
+        # Skip if already offered
+        if tracker.was_offered(item_id):
+            continue
         
-        # Sort by price (cheapest first)
-        affordable_items.sort(key=lambda x: x.get("price", 0))
+        # Skip if price too high
+        if item_price > max_upsell_price:
+            continue
         
-        # Suggest top 2 affordable items
-        for item in affordable_items[:2]:
-            suggestions.append({
-                "item": item,
-                "reason": "Great value addition",
-                "type": "cross-sell",
-                "score": 5.0  # Lower relevance
-            })
-    
-    return suggestions
-
-
-# ============================================================================
-# ORDER ANALYSIS
-# ============================================================================
-
-def _calculate_order_stats(current_order: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Calculate statistics about the current order.
-    
-    Args:
-        current_order: List of items in order
+        # Skip if price too low (not worth suggesting)
+        if item_price < 1.00:
+            continue
         
-    Returns:
-        Dictionary with order statistics
-    """
-    total_items = sum(item.get("quantity", 1) for item in current_order)
-    total_value = sum(
-        item.get("price", 0.0) * item.get("quantity", 1)
-        for item in current_order
-    )
-    
-    categories = [item.get("category", "Other") for item in current_order]
-    category_counts = Counter(categories)
-    
-    avg_item_price = total_value / total_items if total_items > 0 else 0.0
-    
-    return {
-        "total_items": total_items,
-        "total_value": total_value,
-        "unique_items": len(current_order),
-        "categories": list(category_counts.keys()),
-        "category_counts": dict(category_counts),
-        "avg_item_price": avg_item_price
-    }
-
-
-def _suggest_initial_items(
-    menu: Dict[str, Any],
-    max_suggestions: int
-) -> List[Dict[str, Any]]:
-    """
-    Suggest items when order is empty (initial suggestions).
-    
-    Args:
-        menu: Menu dictionary
-        max_suggestions: Max number to return
-        
-    Returns:
-        List of suggested items
-    """
-    suggestions = []
-    all_items = menu.get("items", [])
-    
-    if not all_items:
-        return []
-    
-    # Strategy: Suggest popular categories and mid-priced items
-    
-    # 1. Find items from main categories
-    main_categories = ["pizza", "burger", "pasta", "entree", "main"]
-    
-    for category in main_categories:
-        for item in all_items:
-            item_cat = item.get("category", "").lower()
-            if category in item_cat:
-                suggestions.append({
-                    "item": item,
-                    "reason": "Popular choice",
-                    "type": "featured",
-                    "score": 7.0
-                })
-                break  # One per category
-    
-    # 2. Add some variety from other categories
-    other_items = [
-        item for item in all_items
-        if item not in [s["item"] for s in suggestions]
-    ]
-    
-    # Sort by price (mid-range first)
-    if other_items:
-        prices = [item.get("price", 0.0) for item in other_items]
-        avg_price = sum(prices) / len(prices) if prices else 0.0
-        
-        other_items.sort(
-            key=lambda x: abs(x.get("price", 0.0) - avg_price)
+        # Determine relevance
+        relevance = _calculate_relevance(
+            item,
+            current_items,
+            missing_categories,
+            tracker
         )
         
-        for item in other_items[:2]:
-            suggestions.append({
-                "item": item,
-                "reason": "Try this",
-                "type": "featured",
-                "score": 5.0
+        if relevance > 0:
+            candidates.append({
+                "item_id": item_id,
+                "name": item_name,
+                "price": item_price,
+                "category": item_category,
+                "relevance": relevance,
+                "reason": _generate_reason(item, missing_categories)
             })
     
-    return suggestions[:max_suggestions]
+    return candidates
 
 
-# ============================================================================
-# ADVANCED UPSELL STRATEGIES
-# ============================================================================
-
-def suggest_bundle_deals(
-    menu: Dict[str, Any],
-    current_order: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
+def _calculate_relevance(
+    item: Dict[str, Any],
+    current_items: List[Dict[str, Any]],
+    missing_categories: Set[str],
+    tracker: UpsellTracker
+) -> float:
     """
-    Suggest bundle or combo deals.
+    Calculate relevance score for upsell item.
     
     Args:
-        menu: Menu dictionary
-        current_order: Current order items
+        item: Menu item
+        current_items: Current order items
+        missing_categories: Missing categories
+        tracker: Upsell tracker
         
     Returns:
-        List of bundle suggestions
-        
-    Example:
-        >>> bundles = suggest_bundle_deals(menu, current_order)
+        Relevance score (0.0 to 1.0)
     """
-    # This is a placeholder for bundle logic
-    # In production, you'd have bundle definitions in your database
-    bundles = []
+    score = 0.0
+    item_category = item.get("category", "").lower()
+    item_name = item.get("name", "").lower()
     
-    # Example: If customer has main item but no drink, suggest combo
-    has_main = any(
-        "pizza" in item.get("category", "").lower() or
-        "burger" in item.get("category", "").lower()
-        for item in current_order
+    # Boost if in missing category
+    for missing_cat, keywords in UPSELL_CATEGORIES.items():
+        if missing_cat in missing_categories:
+            if any(kw in item_category or kw in item_name for kw in keywords):
+                score += 0.5
+    
+    # Boost drinks and sides
+    if any(kw in item_category or kw in item_name for kw in UPSELL_CATEGORIES["drinks"]):
+        score += 0.3
+    
+    if any(kw in item_category or kw in item_name for kw in UPSELL_CATEGORIES["sides"]):
+        score += 0.3
+    
+    # Penalize if category already offered
+    for upsell_cat, keywords in UPSELL_CATEGORIES.items():
+        if tracker.was_category_offered(upsell_cat):
+            if any(kw in item_category or kw in item_name for kw in keywords):
+                score -= 0.4
+    
+    # Boost desserts if order is substantial
+    if len(current_items) >= 2:
+        if any(kw in item_category or kw in item_name for kw in UPSELL_CATEGORIES["desserts"]):
+            score += 0.2
+    
+    return max(0.0, min(1.0, score))
+
+
+def _filter_candidates(
+    candidates: List[Dict[str, Any]],
+    tracker: UpsellTracker
+) -> List[Dict[str, Any]]:
+    """
+    Filter candidates for safety.
+    
+    Args:
+        candidates: Candidate upsells
+        tracker: Upsell tracker
+        
+    Returns:
+        Filtered candidates
+    """
+    filtered = []
+    
+    for candidate in candidates:
+        # Skip if relevance too low
+        if candidate["relevance"] < 0.1:
+            continue
+        
+        # Skip if rejected before
+        if candidate["item_id"] in tracker.rejected_items:
+            continue
+        
+        # Skip if accepted before (don't re-suggest)
+        if candidate["item_id"] in tracker.accepted_items:
+            continue
+        
+        filtered.append(candidate)
+    
+    return filtered
+
+
+def _rank_candidates(
+    candidates: List[Dict[str, Any]],
+    current_total: float
+) -> List[Dict[str, Any]]:
+    """
+    Rank candidates by relevance and price.
+    
+    Args:
+        candidates: Filtered candidates
+        current_total: Current order total
+        
+    Returns:
+        Ranked candidates
+    """
+    # Sort by relevance (descending), then price (ascending)
+    ranked = sorted(
+        candidates,
+        key=lambda x: (-x["relevance"], x["price"])
     )
     
-    has_drink = any(
-        "drink" in item.get("category", "").lower()
-        for item in current_order
-    )
-    
-    if has_main and not has_drink:
-        bundles.append({
-            "suggestion": "Add a drink for just $2 more",
-            "type": "combo",
-            "score": 9.0
-        })
-    
-    return bundles
+    return ranked
 
 
-def suggest_quantity_upsell(
-    current_order: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
+def _generate_reason(
+    item: Dict[str, Any],
+    missing_categories: Set[str]
+) -> str:
     """
-    Suggest increasing quantity of existing items.
+    Generate human-readable reason for upsell.
     
     Args:
-        current_order: Current order items
+        item: Menu item
+        missing_categories: Missing categories
         
     Returns:
-        List of quantity upsell suggestions
-        
-    Example:
-        >>> qty_upsells = suggest_quantity_upsell(current_order)
+        Reason string
     """
-    suggestions = []
+    item_category = item.get("category", "").lower()
+    item_name = item.get("name", "")
     
-    # Look for items with quantity = 1
-    for item in current_order:
-        if item.get("quantity", 0) == 1:
-            item_name = item.get("name", "item")
-            suggestions.append({
-                "item": item,
-                "suggestion": f"Add another {item_name}?",
-                "reason": "Great value when you buy more",
-                "type": "quantity-upsell",
-                "score": 6.0
-            })
+    # Check category
+    for cat, keywords in UPSELL_CATEGORIES.items():
+        if cat in missing_categories:
+            if any(kw in item_category for kw in keywords):
+                return f"Complements your order"
     
-    return suggestions
+    # Default reasons
+    if any(kw in item_category for kw in UPSELL_CATEGORIES["drinks"]):
+        return "Popular beverage choice"
+    
+    if any(kw in item_category for kw in UPSELL_CATEGORIES["sides"]):
+        return "Great side dish"
+    
+    if any(kw in item_category for kw in UPSELL_CATEGORIES["desserts"]):
+        return "Perfect finish to your meal"
+    
+    return "Customer favorite"
 
 
-def suggest_by_time_of_day(
-    menu: Dict[str, Any],
-    hour: int
-) -> List[Dict[str, Any]]:
+def format_suggestion_text(suggestions: List[Dict[str, Any]]) -> str:
     """
-    Suggest items based on time of day.
+    Format suggestions into natural text.
     
     Args:
-        menu: Menu dictionary
-        hour: Hour of day (0-23)
+        suggestions: List of suggestions
         
     Returns:
-        List of time-appropriate suggestions
+        Formatted text
         
     Example:
-        >>> from datetime import datetime
-        >>> hour = datetime.now().hour
-        >>> suggestions = suggest_by_time_of_day(menu, hour)
+        >>> text = format_suggestion_text(suggestions)
+        >>> print(text)
+        "Would you like to add a Soda ($2.99) to your order?"
     """
-    suggestions = []
-    all_items = menu.get("items", [])
+    if not suggestions:
+        return ""
     
-    # Breakfast time (6-11)
-    if 6 <= hour < 11:
-        breakfast_categories = ["breakfast", "coffee", "pastry"]
-        for item in all_items:
-            cat = item.get("category", "").lower()
-            if any(b in cat for b in breakfast_categories):
-                suggestions.append({
-                    "item": item,
-                    "reason": "Perfect for breakfast",
-                    "type": "time-based",
-                    "score": 8.0
-                })
+    if len(suggestions) == 1:
+        sug = suggestions[0]
+        return f"Would you like to add {sug['name']} (${sug['price']:.2f})?"
     
-    # Lunch time (11-15)
-    elif 11 <= hour < 15:
-        lunch_categories = ["sandwich", "salad", "soup"]
-        for item in all_items:
-            cat = item.get("category", "").lower()
-            if any(l in cat for l in lunch_categories):
-                suggestions.append({
-                    "item": item,
-                    "reason": "Great lunch option",
-                    "type": "time-based",
-                    "score": 8.0
-                })
+    # Multiple suggestions
+    items = ", ".join([
+        f"{s['name']} (${s['price']:.2f})"
+        for s in suggestions[:-1]
+    ])
+    last = suggestions[-1]
     
-    # Dinner time (17-22)
-    elif 17 <= hour < 22:
-        dinner_categories = ["entree", "pasta", "pizza", "main"]
-        for item in all_items:
-            cat = item.get("category", "").lower()
-            if any(d in cat for d in dinner_categories):
-                suggestions.append({
-                    "item": item,
-                    "reason": "Perfect for dinner",
-                    "type": "time-based",
-                    "score": 8.0
-                })
-    
-    # Late night (22-6)
-    else:
-        late_categories = ["snack", "dessert"]
-        for item in all_items:
-            cat = item.get("category", "").lower()
-            if any(ln in cat for ln in late_categories):
-                suggestions.append({
-                    "item": item,
-                    "reason": "Late night snack",
-                    "type": "time-based",
-                    "score": 7.0
-                })
-    
-    return suggestions
+    return f"Would you like to add {items}, or {last['name']} (${last['price']:.2f})?"
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def format_suggestion_text(suggestion: Dict[str, Any]) -> str:
+def mark_upsell_accepted(call_id: str, item_id: str):
     """
-    Format a suggestion into natural language text.
+    Mark upsell as accepted.
     
     Args:
-        suggestion: Suggestion dictionary
-        
-    Returns:
-        Natural language suggestion text
-        
-    Example:
-        >>> text = format_suggestion_text(suggestion)
-        >>> print(text)  # "Would you like to add Coca-Cola? Pairs well with your pizza."
+        call_id: Call identifier
+        item_id: Item identifier
     """
-    item = suggestion["item"]
-    reason = suggestion["reason"]
-    item_name = item.get("name", "this item")
-    item_price = item.get("price", 0.0)
-    
-    return f"Would you like to add {item_name} (${item_price:.2f})? {reason}."
+    tracker = _get_tracker(call_id)
+    tracker.mark_accepted(item_id)
 
 
-def get_top_suggestion(
-    menu: Dict[str, Any],
-    current_order: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
+def mark_upsell_rejected(call_id: str, item_id: str):
     """
-    Get the single best suggestion.
+    Mark upsell as rejected.
     
     Args:
-        menu: Menu dictionary
-        current_order: Current order
+        call_id: Call identifier
+        item_id: Item identifier
+    """
+    tracker = _get_tracker(call_id)
+    tracker.mark_rejected(item_id)
+
+
+def customer_declined_all_upsells(call_id: str):
+    """
+    Mark that customer declined all upsells.
+    
+    Args:
+        call_id: Call identifier
+    """
+    tracker = _get_tracker(call_id)
+    tracker.mark_declined_all()
+
+
+def disable_upsells(call_id: str):
+    """
+    Disable upsells for call.
+    
+    Args:
+        call_id: Call identifier
+    """
+    tracker = _get_tracker(call_id)
+    tracker.disable_upsells()
+
+
+def get_upsell_stats(call_id: str) -> Dict[str, Any]:
+    """
+    Get upsell statistics for call.
+    
+    Args:
+        call_id: Call identifier
         
     Returns:
-        Top suggestion or None
-        
-    Example:
-        >>> top = get_top_suggestion(menu, current_order)
-        >>> if top:
-        >>>     print(format_suggestion_text(top))
+        Statistics dictionary
     """
-    suggestions = suggest_upsells(menu, current_order, max_suggestions=1)
-    return suggestions[0] if suggestions else None
+    tracker = _get_tracker(call_id)
+    return tracker.get_stats()
 
 
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
+def clear_upsell_tracker(call_id: str):
+    """
+    Clear upsell tracker (cleanup).
+    
+    Args:
+        call_id: Call identifier
+    """
+    if call_id in _upsell_trackers:
+        del _upsell_trackers[call_id]
+        logger.debug(f"Upsell tracker cleared for {call_id}")
+
 
 if __name__ == "__main__":
-    """
-    Example usage of the upsell engine.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
-    print("Upsell Intelligence Example")
+    print("Upsell Module (Production)")
     print("=" * 50)
     
-    # Mock menu
-    menu = {
+    # Sample menu
+    sample_menu = {
         "items": [
-            {"id": "pizza_1", "name": "Margherita Pizza", "price": 12.99, "category": "Pizza"},
-            {"id": "pizza_2", "name": "Deluxe Pizza", "price": 16.99, "category": "Pizza"},
-            {"id": "drink_1", "name": "Coca-Cola", "price": 2.50, "category": "Drinks"},
-            {"id": "side_1", "name": "Garlic Bread", "price": 4.99, "category": "Sides"},
-            {"id": "dessert_1", "name": "Tiramisu", "price": 6.99, "category": "Desserts"},
-            {"id": "salad_1", "name": "Caesar Salad", "price": 8.99, "category": "Salads"},
+            {"id": "1", "name": "Large Pizza", "price": 15.99, "category": "Pizza", "available": True},
+            {"id": "2", "name": "Soda", "price": 2.99, "category": "Drinks", "available": True},
+            {"id": "3", "name": "Fries", "price": 3.99, "category": "Sides", "available": True},
+            {"id": "4", "name": "Ice Cream", "price": 4.99, "category": "Desserts", "available": True},
+            {"id": "5", "name": "Wings", "price": 9.99, "category": "Appetizers", "available": True}
         ]
     }
     
-    # Mock current order
-    current_order = [
-        {
-            "item_id": "pizza_1",
-            "name": "Margherita Pizza",
-            "price": 12.99,
-            "quantity": 1,
-            "category": "Pizza"
-        }
-    ]
+    # Sample order
+    sample_order = {
+        "items": [
+            {"id": "1", "name": "Large Pizza", "price": 15.99, "category": "Pizza"}
+        ],
+        "total": 17.27
+    }
     
-    print("\n1. Current Order:")
-    for item in current_order:
-        print(f"   - {item['quantity']}x {item['name']} (${item['price']})")
+    call_id = "test_call_123"
     
-    # Get suggestions
-    print("\n2. Upsell Suggestions:")
-    suggestions = suggest_upsells(menu, current_order)
+    print(f"\nCall: {call_id}")
+    print(f"Current order: {sample_order['items'][0]['name']}")
+    print(f"Total: ${sample_order['total']:.2f}")
     
-    for i, suggestion in enumerate(suggestions, 1):
-        item = suggestion["item"]
-        print(f"   {i}. {item['name']} (${item['price']:.2f})")
-        print(f"      Type: {suggestion['type']}")
-        print(f"      Reason: {suggestion['reason']}")
-        print(f"      Score: {suggestion['score']}")
-        print()
+    # Generate suggestions
+    suggestions = suggest_upsells(call_id, sample_menu, sample_order, max_suggestions=2)
     
-    # Format as natural language
-    print("3. Natural Language Suggestions:")
-    for suggestion in suggestions[:3]:
-        text = format_suggestion_text(suggestion)
-        print(f"   - {text}")
+    print(f"\nUpsell suggestions ({len(suggestions)}):")
+    for sug in suggestions:
+        print(f"  - {sug['name']} (${sug['price']:.2f}) - {sug['reason']}")
     
-    # Top suggestion
-    print("\n4. Top Recommendation:")
-    top = get_top_suggestion(menu, current_order)
-    if top:
-        print(f"   {format_suggestion_text(top)}")
+    # Format text
+    text = format_suggestion_text(suggestions)
+    print(f"\nFormatted: {text}")
     
-    # Empty order suggestions
-    print("\n5. Initial Suggestions (Empty Order):")
-    initial_suggestions = suggest_upsells(menu, [])
-    for suggestion in initial_suggestions[:3]:
-        item = suggestion["item"]
-        print(f"   - {item['name']}: {suggestion['reason']}")
+    # Mark one accepted
+    if suggestions:
+        mark_upsell_accepted(call_id, suggestions[0]["item_id"])
+    
+    # Try again (should get different suggestions)
+    suggestions2 = suggest_upsells(call_id, sample_menu, sample_order, max_suggestions=2)
+    print(f"\nSecond round ({len(suggestions2)}):")
+    for sug in suggestions2:
+        print(f"  - {sug['name']} (${sug['price']:.2f})")
+    
+    # Stats
+    stats = get_upsell_stats(call_id)
+    print(f"\nStats:")
+    print(f"  Total offered: {stats['total_offered']}")
+    print(f"  Total accepted: {stats['total_accepted']}")
+    print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
+    
+    print("\n" + "=" * 50)
+    print("Production upsell module ready")
