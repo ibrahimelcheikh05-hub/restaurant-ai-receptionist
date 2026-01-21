@@ -1,19 +1,21 @@
 """
-Main AI Orchestrator
-====================
-Central brain of the voice ordering system.
-Coordinates all modules and manages conversation flow.
+Main AI Orchestrator (Production)
+==================================
+Deterministic call orchestration with formal lifecycle management.
+Central brain coordinating all call components with safety watchdogs.
 """
 
 import os
 import asyncio
 import logging
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
+import json
+
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
-# Import all modules
 from memory import create_call_memory, get_memory, clear_memory, CallMemory
 from db import db
 from menu import get_menu, format_menu_for_prompt
@@ -26,107 +28,203 @@ from detect import detect_language
 from translate import to_english, from_english
 
 
-# ============================================================================
-# LOGGING CONFIGURATION
-# ============================================================================
-
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# AI Provider Configuration
-AI_PROVIDER = os.getenv("AI_PROVIDER", "claude")  # "claude" or "openai"
-
-# Claude Configuration
-CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-
-# OpenAI Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
-
-# System Prompt (loaded from environment)
-SYSTEM_AGENT_PROMPT = os.getenv(
-    "SYSTEM_AGENT_PROMPT",
-    """You are a professional restaurant phone order assistant.
-
-Your responsibilities:
-1. Greet customers warmly
-2. Help them browse the menu
-3. Take accurate orders
-4. Suggest complementary items (upsells)
-5. Confirm order details
-6. Collect delivery/pickup information
-7. Provide order total
-
-Guidelines:
-- Be friendly and professional
-- Listen carefully to customer requests
-- Clarify any ambiguities
-- Suggest items when appropriate (but don't be pushy)
-- Confirm all details before finalizing
-- Keep responses concise and natural
-
-Order Process:
-1. Greet customer
-2. Take order (one or more items)
-3. Suggest complementary items if appropriate
-4. Confirm order details
-5. Get customer information (name, phone, address if delivery)
-6. Provide total and estimated time
-7. Thank customer and end call
-"""
-)
-
-# Conversation settings
-MAX_CONVERSATION_TURNS = 50
-DEFAULT_LANGUAGE = "en"
+class CallState(Enum):
+    """Formal call lifecycle states."""
+    INIT = "init"
+    GREETING = "greeting"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    TRANSFERRING = "transferring"
+    ENDING = "ending"
+    CLOSED = "closed"
 
 
-# ============================================================================
-# AI CLIENT INITIALIZATION
-# ============================================================================
-
-def _get_ai_client():
-    """Get AI client based on provider configuration."""
-    if AI_PROVIDER.lower() == "claude":
-        if not CLAUDE_API_KEY:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY environment variable not set for Claude"
-            )
-        return AsyncAnthropic(api_key=CLAUDE_API_KEY)
+class CallSession:
+    """
+    Central call session controller.
+    Manages call lifecycle, state transitions, and watchdogs.
+    """
     
-    elif AI_PROVIDER.lower() == "openai":
-        if not OPENAI_API_KEY:
-            raise RuntimeError(
-                "OPENAI_API_KEY environment variable not set for OpenAI"
+    def __init__(self, call_id: str, restaurant_id: str):
+        self.call_id = call_id
+        self.restaurant_id = restaurant_id
+        self.state = CallState.INIT
+        self.memory: Optional[CallMemory] = None
+        
+        # Metadata
+        self.customer_phone: Optional[str] = None
+        self.detected_language: Optional[str] = None
+        self.start_time = datetime.utcnow()
+        self.last_activity = datetime.utcnow()
+        
+        # Counters
+        self.turn_count = 0
+        self.ai_error_count = 0
+        self.silence_count = 0
+        
+        # Watchdog tasks
+        self.silence_watchdog_task: Optional[asyncio.Task] = None
+        self.duration_watchdog_task: Optional[asyncio.Task] = None
+        
+        # Cancellation
+        self.is_cancelled = False
+        
+        # Configuration
+        self.max_call_duration = 900  # 15 minutes
+        self.max_silence_duration = 30  # 30 seconds
+        self.max_turns = 100
+        self.max_ai_errors = 3
+        
+        logger.info(f"CallSession created: {call_id}")
+    
+    def transition(self, new_state: CallState) -> bool:
+        """
+        Attempt state transition with validation.
+        
+        Returns:
+            True if transition allowed, False otherwise
+        """
+        valid_transitions = {
+            CallState.INIT: [CallState.GREETING, CallState.CLOSED],
+            CallState.GREETING: [CallState.LISTENING, CallState.CLOSED],
+            CallState.LISTENING: [CallState.THINKING, CallState.ENDING, CallState.CLOSED],
+            CallState.THINKING: [CallState.SPEAKING, CallState.TRANSFERRING, CallState.ENDING, CallState.CLOSED],
+            CallState.SPEAKING: [CallState.LISTENING, CallState.ENDING, CallState.CLOSED],
+            CallState.TRANSFERRING: [CallState.CLOSED],
+            CallState.ENDING: [CallState.CLOSED],
+            CallState.CLOSED: []
+        }
+        
+        if new_state in valid_transitions.get(self.state, []):
+            old_state = self.state
+            self.state = new_state
+            logger.info(f"Call {self.call_id}: {old_state.value} → {new_state.value}")
+            return True
+        else:
+            logger.warning(
+                f"Invalid transition for {self.call_id}: "
+                f"{self.state.value} → {new_state.value}"
             )
-        return AsyncOpenAI(api_key=OPENAI_API_KEY)
+            return False
+    
+    def update_activity(self):
+        """Update last activity timestamp."""
+        self.last_activity = datetime.utcnow()
+    
+    def increment_turn(self):
+        """Increment turn counter and check limit."""
+        self.turn_count += 1
+        if self.turn_count >= self.max_turns:
+            logger.warning(f"Max turns reached for {self.call_id}")
+            return False
+        return True
+    
+    def increment_error(self):
+        """Increment error counter and check limit."""
+        self.ai_error_count += 1
+        if self.ai_error_count >= self.max_ai_errors:
+            logger.error(f"Max AI errors reached for {self.call_id}")
+            return False
+        return True
+    
+    async def start_watchdogs(self):
+        """Start safety watchdog tasks."""
+        self.silence_watchdog_task = asyncio.create_task(
+            self._silence_watchdog()
+        )
+        self.duration_watchdog_task = asyncio.create_task(
+            self._duration_watchdog()
+        )
+    
+    async def stop_watchdogs(self):
+        """Stop watchdog tasks."""
+        if self.silence_watchdog_task and not self.silence_watchdog_task.done():
+            self.silence_watchdog_task.cancel()
+            try:
+                await self.silence_watchdog_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self.duration_watchdog_task and not self.duration_watchdog_task.done():
+            self.duration_watchdog_task.cancel()
+            try:
+                await self.duration_watchdog_task
+            except asyncio.CancelledError:
+                pass
+    
+    async def _silence_watchdog(self):
+        """Monitor for excessive silence."""
+        try:
+            while not self.is_cancelled:
+                await asyncio.sleep(5)
+                
+                if self.state not in [CallState.LISTENING, CallState.SPEAKING]:
+                    continue
+                
+                silence_duration = (datetime.utcnow() - self.last_activity).total_seconds()
+                
+                if silence_duration > self.max_silence_duration:
+                    logger.warning(f"Silence timeout for {self.call_id}")
+                    self.silence_count += 1
+                    
+                    if self.silence_count >= 3:
+                        self.transition(CallState.ENDING)
+                        break
+                    
+                    # Reset activity to prevent immediate re-trigger
+                    self.update_activity()
+        
+        except asyncio.CancelledError:
+            pass
+    
+    async def _duration_watchdog(self):
+        """Monitor call duration."""
+        try:
+            while not self.is_cancelled:
+                await asyncio.sleep(10)
+                
+                duration = (datetime.utcnow() - self.start_time).total_seconds()
+                
+                if duration > self.max_call_duration:
+                    logger.warning(f"Max duration reached for {self.call_id}")
+                    self.transition(CallState.ENDING)
+                    break
+        
+        except asyncio.CancelledError:
+            pass
+    
+    async def cancel(self):
+        """Cancel the call session."""
+        self.is_cancelled = True
+        await self.stop_watchdogs()
+
+
+_active_sessions: Dict[str, CallSession] = {}
+
+
+def _get_llm_client():
+    """Get LLM client based on configuration."""
+    provider = os.getenv("LLM_PROVIDER", "claude").lower()
+    
+    if provider == "claude":
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        return AsyncAnthropic(api_key=api_key), "claude"
+    
+    elif provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        return AsyncOpenAI(api_key=api_key), "openai"
     
     else:
-        raise ValueError(
-            f"Unknown AI_PROVIDER: {AI_PROVIDER}. Use 'claude' or 'openai'"
-        )
+        raise RuntimeError(f"Unknown LLM provider: {provider}")
 
-
-# Global AI client (lazy-loaded)
-_ai_client = None
-
-
-def get_ai_client():
-    """Get or create AI client."""
-    global _ai_client
-    if _ai_client is None:
-        _ai_client = _get_ai_client()
-    return _ai_client
-
-
-# ============================================================================
-# CALL LIFECYCLE HANDLERS
-# ============================================================================
 
 async def handle_call_start(
     call_id: str,
@@ -134,61 +232,71 @@ async def handle_call_start(
     customer_phone: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Initialize a new call session.
+    Initialize call session and generate greeting.
     
     Args:
         call_id: Unique call identifier
-        restaurant_id: Restaurant identifier
-        customer_phone: Optional customer phone number
+        restaurant_id: Restaurant ID
+        customer_phone: Customer phone number
         
     Returns:
-        Call initialization status
-        
-    Raises:
-        RuntimeError: If initialization fails
-        
-    Example:
-        >>> result = await handle_call_start("CA123", "rest_123")
+        Response with greeting and language
     """
     try:
-        # 1. Create memory for this call
-        memory = create_call_memory(call_id)
-        memory.set_restaurant_id(restaurant_id)
-        memory.set_state("call_active")
+        # Create session
+        session = CallSession(call_id, restaurant_id)
+        session.customer_phone = customer_phone
+        _active_sessions[call_id] = session
         
-        if customer_phone:
-            memory.set_customer_info(phone=customer_phone)
+        # Transition to greeting
+        session.transition(CallState.GREETING)
         
-        # 2. Load menu
-        menu = get_menu(restaurant_id)
-        memory.set_menu_snapshot(menu.get("items", []))
+        # Create memory
+        memory = create_call_memory(call_id, restaurant_id)
+        session.memory = memory
         
-        # 3. Create order
+        # Load menu
+        menu = await get_menu(restaurant_id)
+        memory.set_menu_snapshot(menu)
+        
+        # Create order
         create_order(call_id, restaurant_id)
         
-        # 4. Initialize call log in database
-        call_log_data = {
+        # Start watchdogs
+        await session.start_watchdogs()
+        
+        # Generate greeting
+        default_language = os.getenv("DEFAULT_LANGUAGE", "en")
+        greeting = "Thank you for calling Captain Jay's Fish & Chicken! How can I help you today?"
+        
+        # Log to database
+        db.store_call_log({
             "restaurant_id": restaurant_id,
             "caller_phone": customer_phone or "unknown",
             "call_sid": call_id,
             "direction": "inbound",
-            "status": "in-progress"
-        }
-        call_log = db.store_call_log(call_log_data)
+            "status": "in-progress",
+            "transcript": f"Call started: {greeting}"
+        })
+        
+        # Transition to listening
+        session.transition(CallState.LISTENING)
         
         return {
-            "status": "initialized",
+            "status": "started",
             "call_id": call_id,
-            "restaurant_id": restaurant_id,
-            "menu_items": len(menu.get("items", [])),
-            "call_log_id": call_log.get("id"),
-            "timestamp": datetime.utcnow().isoformat()
+            "greeting": greeting,
+            "language": default_language
         }
         
     except Exception as e:
-        # Clean up on failure
-        clear_memory(call_id)
-        raise RuntimeError(f"Failed to initialize call: {str(e)}")
+        logger.error(f"Error starting call {call_id}: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "greeting": "We're experiencing technical difficulties. Please try again.",
+            "language": "en"
+        }
 
 
 async def handle_user_text(
@@ -197,400 +305,293 @@ async def handle_user_text(
     detected_language: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Process user input text through the full AI pipeline.
-    
-    This is the main conversation handler that:
-    1. Detects/validates language
-    2. Translates to English if needed
-    3. Processes through AI
-    4. Translates response back to user language
-    5. Returns response for TTS
+    Process user input and generate AI response.
     
     Args:
-        text: User input text (transcribed from speech)
+        text: User's input text
         call_id: Call identifier
-        detected_language: Optional pre-detected language
+        detected_language: Detected language code
         
     Returns:
-        Dictionary with:
-        - response_text: AI response in user's language
-        - language: User's language
-        - intent: Detected intent (if any)
-        - actions: Any actions taken (order updates, etc.)
-        
-    Raises:
-        RuntimeError: If processing fails
-        
-    Example:
-        >>> result = await handle_user_text("I want pizza", "CA123")
-        >>> print(result["response_text"])
+        Response dictionary with text and actions
     """
+    session = _active_sessions.get(call_id)
+    
+    if not session:
+        logger.error(f"No session found for call {call_id}")
+        return {
+            "response_text": "I apologize, but I've lost track of our conversation. Please call back.",
+            "language": "en",
+            "actions": {}
+        }
+    
+    if session.state == CallState.CLOSED:
+        return {
+            "response_text": "",
+            "language": "en",
+            "actions": {}
+        }
+    
     try:
+        # Update activity
+        session.update_activity()
+        
+        # Transition to thinking
+        if not session.transition(CallState.THINKING):
+            return _fallback_response(session)
+        
+        # Check turn limit
+        if not session.increment_turn():
+            session.transition(CallState.ENDING)
+            return {
+                "response_text": "Thank you for your time. If you need anything else, please call back.",
+                "language": detected_language or "en",
+                "actions": {"end_call": True}
+            }
+        
         # Get memory
         memory = get_memory(call_id)
         if not memory:
-            raise RuntimeError(
-                f"No active call found for call_id '{call_id}'. "
-                f"Call handle_call_start() first."
-            )
+            logger.error(f"Memory not found for {call_id}")
+            return _fallback_response(session)
         
-        # 1. LANGUAGE DETECTION
+        # Update detected language
+        if detected_language and not session.detected_language:
+            session.detected_language = detected_language
+        
+        # Detect language if not set
         if not detected_language:
             detection = detect_language(text)
-            user_language = detection["language"]
-            
-            # Update memory with detected language
-            if not memory.detected_language:
-                memory.update_language(user_language)
-        else:
-            user_language = detected_language
+            detected_language = detection.get("language", "en")
+            session.detected_language = detected_language
         
-        # Store user language in memory
-        if not memory.detected_language:
-            memory.update_language(user_language)
+        # Translate to English if needed
+        english_text = text
+        if detected_language != "en":
+            english_text = await to_english(text, detected_language)
         
-        # 2. TRANSLATION TO ENGLISH (if needed)
-        if user_language != "en":
-            english_text = await to_english(text, user_language)
-        else:
-            english_text = text
-        
-        # 3. ADD TO CONVERSATION CONTEXT
+        # Add user input to memory
         memory.add_conversation_turn(
             role="user",
             content=english_text,
-            intent=None  # Will be determined by AI
+            intent="order_inquiry"
         )
         
-        # 4. BUILD AI PROMPT
-        prompt = await _build_ai_prompt(call_id, english_text, memory)
+        # Generate AI response
+        ai_response = await _generate_ai_response(session, english_text)
         
-        # 5. CALL AI MODEL
-        ai_response = await _call_ai_model(prompt, memory)
+        if not ai_response:
+            if not session.increment_error():
+                session.transition(CallState.ENDING)
+            return _fallback_response(session)
         
-        # 6. PROCESS AI RESPONSE
-        actions_taken = await _process_ai_response(
-            ai_response,
-            call_id,
-            memory
-        )
+        # Process AI actions
+        actions = await _process_ai_response(ai_response, call_id, memory)
         
-        # 6.5. CHECK FOR TRANSFER INTENT
-        transfer_detected = detect_transfer_intent(english_text, ai_response)
+        # Check for transfer
+        transfer_requested = _detect_transfer_intent(english_text, ai_response)
         
-        if transfer_detected:
-            logger.info(f"Transfer intent detected for call {call_id}")
-            
-            # Request transfer
-            transfer_result = await request_call_transfer(
+        if transfer_requested:
+            transfer_result = await _request_call_transfer(
                 call_id,
-                reason="Customer requested to speak with human agent"
+                "Customer requested human assistance"
             )
-            
-            # Add transfer flag to actions
-            actions_taken["transfer_requested"] = True
-            actions_taken["transfer_details"] = transfer_result
+            actions["transfer_requested"] = True
+            actions["transfer_details"] = transfer_result
+            session.transition(CallState.TRANSFERRING)
         
-        # 7. ADD AI RESPONSE TO CONTEXT
+        # Add AI response to memory
         memory.add_conversation_turn(
             role="assistant",
             content=ai_response,
-            intent=actions_taken.get("intent")
+            intent="response"
         )
         
-        # 8. TRANSLATE RESPONSE BACK TO USER LANGUAGE
-        if user_language != "en":
-            response_text = await from_english(ai_response, user_language)
-        else:
-            response_text = ai_response
+        # Translate response if needed
+        response_text = ai_response
+        if detected_language != "en":
+            response_text = await from_english(ai_response, detected_language)
+        
+        # Transition to speaking
+        session.transition(CallState.SPEAKING)
         
         return {
             "response_text": response_text,
-            "language": user_language,
-            "intent": actions_taken.get("intent"),
-            "actions": actions_taken,
-            "original_text": text,
-            "english_text": english_text
+            "language": detected_language,
+            "actions": actions
         }
         
     except Exception as e:
-        # Log error but don't crash
-        error_msg = f"Error processing user text: {str(e)}"
-        print(f"ERROR: {error_msg}")
+        logger.error(f"Error processing user text: {str(e)}", exc_info=True)
         
-        # Return fallback response
-        fallback = "I apologize, I'm having trouble processing that. Could you please repeat?"
+        if session and not session.increment_error():
+            session.transition(CallState.ENDING)
         
-        # Translate fallback if needed
-        if user_language and user_language != "en":
-            try:
-                fallback = await from_english(fallback, user_language)
-            except:
-                pass  # Use English fallback if translation fails
-        
-        return {
-            "response_text": fallback,
-            "language": user_language or DEFAULT_LANGUAGE,
-            "intent": "error",
-            "actions": {"error": error_msg},
-            "error": True
-        }
+        return _fallback_response(session)
 
 
 async def handle_call_end(call_id: str) -> Dict[str, Any]:
     """
-    Finalize call and clean up resources.
+    Handle call termination and cleanup.
     
     Args:
         call_id: Call identifier
         
     Returns:
-        Call summary and cleanup status
-        
-    Example:
-        >>> summary = await handle_call_end("CA123")
+        Status dictionary
     """
     try:
-        # Get memory
-        memory = get_memory(call_id)
+        session = _active_sessions.get(call_id)
         
-        if not memory:
-            return {
-                "status": "no_active_call",
-                "call_id": call_id
-            }
-        
-        # Get final state
-        order_summary = get_order_summary(call_id)
-        conversation = memory.get_recent_context(num_turns=100)
-        
-        # Update call state
-        memory.set_state("call_completed")
-        
-        # Try to finalize order if it has items
-        order_finalized = False
-        order_id = None
-        
-        if not order_summary["is_empty"]:
-            try:
-                # Validate and finalize order
-                is_valid, errors = validate_order(call_id)
+        if session:
+            # Transition to ending
+            session.transition(CallState.ENDING)
+            
+            # Stop watchdogs
+            await session.cancel()
+            
+            # Finalize order if valid
+            memory = get_memory(call_id)
+            if memory:
+                try:
+                    order_summary = get_order_summary(call_id)
+                    
+                    if order_summary and validate_order(call_id):
+                        final_order = finalize_order(
+                            call_id,
+                            customer_phone=session.customer_phone
+                        )
+                        
+                        if final_order:
+                            logger.info(f"Order finalized for {call_id}: {final_order['order_id']}")
+                            
+                            # Send SMS confirmation
+                            if session.customer_phone:
+                                try:
+                                    from sms import send_order_confirmation
+                                    send_order_confirmation(
+                                        session.customer_phone,
+                                        final_order
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to send SMS: {str(e)}")
                 
-                if is_valid:
-                    final_order = finalize_order(
-                        call_id,
-                        customer_phone=memory.customer_phone,
-                        customer_name=memory.customer_name
-                    )
-                    order_finalized = True
-                    order_id = final_order.get("order_id")
-            except Exception as e:
-                print(f"Warning: Could not finalize order: {str(e)}")
-        
-        # Update call log in database
-        try:
-            call_log_updates = {
+                except Exception as e:
+                    logger.error(f"Error finalizing order: {str(e)}")
+            
+            # Update call log
+            duration = (datetime.utcnow() - session.start_time).total_seconds()
+            
+            db.store_call_log({
+                "restaurant_id": session.restaurant_id,
+                "caller_phone": session.customer_phone or "unknown",
+                "call_sid": call_id,
+                "direction": "inbound",
                 "status": "completed",
-                "duration": int((datetime.utcnow() - memory.call_start_time).total_seconds()),
-                "transcript": "\n".join([
-                    f"{turn['role']}: {turn['content']}"
-                    for turn in conversation
-                ])
-            }
+                "duration": int(duration),
+                "transcript": f"Call ended. Duration: {int(duration)}s, Turns: {session.turn_count}"
+            })
             
-            # Find call log by call_sid
-            # Note: This assumes we stored call_log_id in memory or can find by call_sid
-            # For now, we'll use a simple approach
+            # Transition to closed
+            session.transition(CallState.CLOSED)
             
-        except Exception as e:
-            print(f"Warning: Could not update call log: {str(e)}")
-        
-        # Get summary
-        summary = {
-            "status": "completed",
-            "call_id": call_id,
-            "restaurant_id": memory.restaurant_id,
-            "order_finalized": order_finalized,
-            "order_id": order_id,
-            "total_turns": memory.turn_count,
-            "order_summary": order_summary,
-            "customer_phone": memory.customer_phone,
-            "customer_name": memory.customer_name,
-            "detected_language": memory.detected_language,
-            "call_duration_seconds": int(
-                (datetime.utcnow() - memory.call_start_time).total_seconds()
-            )
-        }
+            # Remove from active sessions
+            _active_sessions.pop(call_id, None)
         
         # Clear memory
         clear_memory(call_id)
         
-        return summary
+        logger.info(f"Call ended: {call_id}")
+        
+        return {"status": "ended", "call_id": call_id}
         
     except Exception as e:
-        # Clean up memory even on error
-        clear_memory(call_id)
-        raise RuntimeError(f"Failed to end call: {str(e)}")
+        logger.error(f"Error ending call: {str(e)}", exc_info=True)
+        return {"status": "error", "error": str(e)}
 
 
-# ============================================================================
-# AI PROMPT CONSTRUCTION
-# ============================================================================
-
-async def _build_ai_prompt(
-    call_id: str,
-    user_text: str,
-    memory: CallMemory
-) -> str:
+async def _generate_ai_response(session: CallSession, user_text: str) -> Optional[str]:
     """
-    Build comprehensive AI prompt with context.
+    Generate AI response using LLM.
     
     Args:
-        call_id: Call identifier
-        user_text: User's message in English
-        memory: Call memory instance
+        session: Call session
+        user_text: User's text input (English)
         
     Returns:
-        Complete prompt for AI
+        AI response text or None on error
     """
-    # Get current order
-    order_summary = get_order_summary(call_id)
-    
-    # Get menu
-    menu = {
-        "items": memory.menu_snapshot,
-        "has_items": len(memory.menu_snapshot) > 0
-    }
-    formatted_menu = format_menu_for_prompt(menu)
-    
-    # Get upsell suggestions
-    current_order_items = order_summary["items"]
-    suggestions = suggest_upsells(menu, current_order_items, max_suggestions=3)
-    
-    upsell_text = ""
-    if suggestions:
-        upsell_text = "\n\nSUGGESTED UPSELLS (mention naturally if appropriate):\n"
-        for suggestion in suggestions:
-            upsell_text += f"- {format_suggestion_text(suggestion)}\n"
-    
-    # Get conversation history
-    recent_context = memory.get_recent_context(num_turns=10)
-    conversation_history = ""
-    if recent_context:
-        conversation_history = "\n\nRECENT CONVERSATION:\n"
-        for turn in recent_context[:-1]:  # Exclude current turn
-            conversation_history += f"{turn['role'].upper()}: {turn['content']}\n"
-    
-    # Build current order text
-    order_text = "\n\nCURRENT ORDER:\n"
-    if order_summary["is_empty"]:
-        order_text += "Empty (no items yet)\n"
-    else:
-        for item in order_summary["items"]:
-            customizations = ", ".join(item.get("customizations", []))
-            custom_text = f" ({customizations})" if customizations else ""
-            order_text += f"- {item['quantity']}x {item['name']}{custom_text} @ ${item['price']}\n"
-        order_text += f"\nSubtotal: ${order_summary['subtotal']:.2f}\n"
-        order_text += f"Tax: ${order_summary['tax']:.2f}\n"
-        order_text += f"TOTAL: ${order_summary['total']:.2f}\n"
-    
-    # Customer info
-    customer_info = "\n\nCUSTOMER INFO:\n"
-    if memory.customer_phone:
-        customer_info += f"Phone: {memory.customer_phone}\n"
-    if memory.customer_name:
-        customer_info += f"Name: {memory.customer_name}\n"
-    if not memory.customer_phone and not memory.customer_name:
-        customer_info += "Not yet collected\n"
-    
-    # Build complete prompt
-    prompt = f"""SYSTEM: {SYSTEM_AGENT_PROMPT}
-
-{formatted_menu}
-
-{order_text}
-
-{customer_info}
-
-{upsell_text}
-
-{conversation_history}
-
-USER: {user_text}
-
-ASSISTANT: """
-    
-    return prompt
-
-
-# ============================================================================
-# AI MODEL INTERACTION
-# ============================================================================
-
-async def _call_ai_model(
-    prompt: str,
-    memory: CallMemory
-) -> str:
-    """
-    Call AI model (Claude or OpenAI) with prompt.
-    
-    Args:
-        prompt: Complete prompt
-        memory: Call memory
-        
-    Returns:
-        AI response text
-    """
-    client = get_ai_client()
-    
     try:
-        if AI_PROVIDER.lower() == "claude":
-            # Call Claude API
+        memory = session.memory
+        if not memory:
+            return None
+        
+        # Build context
+        menu_text = format_menu_for_prompt(memory.get_menu_snapshot())
+        order_summary = get_order_summary(session.call_id)
+        conversation_history = memory.get_conversation_history()
+        
+        # Get upsell suggestions
+        upsell_suggestions = suggest_upsells(
+            session.call_id,
+            memory.get_menu_snapshot()
+        )
+        upsell_text = format_suggestion_text(upsell_suggestions) if upsell_suggestions else ""
+        
+        # Build prompt
+        system_prompt = os.getenv(
+            "SYSTEM_AGENT_PROMPT",
+            "You are a professional restaurant phone order assistant."
+        )
+        
+        context = f"""
+Current Menu:
+{menu_text}
+
+Current Order:
+{json.dumps(order_summary, indent=2) if order_summary else "No items yet"}
+
+{f"Suggested Upsells: {upsell_text}" if upsell_text else ""}
+
+Conversation History:
+{json.dumps(conversation_history[-5:], indent=2)}
+"""
+        
+        user_message = f"{context}\n\nCustomer: {user_text}\n\nRespond naturally and helpfully:"
+        
+        # Call LLM
+        client, provider = _get_llm_client()
+        
+        if provider == "claude":
             response = await client.messages.create(
-                model=CLAUDE_MODEL,
+                model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
                 max_tokens=1024,
-                temperature=0.7,
+                system=system_prompt,
                 messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "user", "content": user_message}
                 ]
             )
             
-            # Extract text from response
-            return response.content[0].text
-            
-        elif AI_PROVIDER.lower() == "openai":
-            # Call OpenAI API
+            return response.content[0].text.strip()
+        
+        elif provider == "openai":
             response = await client.chat.completions.create(
-                model=OPENAI_MODEL,
+                model=os.getenv("OPENAI_MODEL", "gpt-4"),
                 max_tokens=1024,
-                temperature=0.7,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": SYSTEM_AGENT_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
                 ]
             )
             
-            return response.choices[0].message.content
-            
-        else:
-            raise ValueError(f"Unknown AI provider: {AI_PROVIDER}")
-            
+            return response.choices[0].message.content.strip()
+        
+        return None
+        
     except Exception as e:
-        raise RuntimeError(f"AI model call failed: {str(e)}")
+        logger.error(f"AI generation error: {str(e)}", exc_info=True)
+        return None
 
-
-# ============================================================================
-# AI RESPONSE PROCESSING
-# ============================================================================
 
 async def _process_ai_response(
     ai_response: str,
@@ -598,197 +599,83 @@ async def _process_ai_response(
     memory: CallMemory
 ) -> Dict[str, Any]:
     """
-    Process AI response and execute any actions.
-    
-    This includes:
-    - Intent detection
-    - Order modifications
-    - Information extraction
+    Process AI response and extract actions.
     
     Args:
-        ai_response: Response from AI
+        ai_response: AI's response text
         call_id: Call identifier
         memory: Call memory
         
     Returns:
-        Dictionary of actions taken
+        Actions dictionary
     """
-    actions = {
-        "intent": None,
-        "order_modified": False,
-        "info_collected": False
-    }
+    actions = {}
     
-    # Simple intent detection based on response content
-    response_lower = ai_response.lower()
-    
-    # Detect intents
-    if any(word in response_lower for word in ["added", "add", "order"]):
-        actions["intent"] = "add_item"
-    elif any(word in response_lower for word in ["remove", "delete", "cancel"]):
-        actions["intent"] = "remove_item"
-    elif any(word in response_lower for word in ["total", "confirm", "finalize"]):
-        actions["intent"] = "confirm_order"
-    elif any(word in response_lower for word in ["hello", "hi", "welcome"]):
-        actions["intent"] = "greeting"
-    else:
-        actions["intent"] = "conversation"
-    
-    # Update last intent in memory
-    if actions["intent"]:
-        memory.set_last_intent(actions["intent"])
-    
-    return actions
-
-
-# ============================================================================
-# CALL TRANSFER LOGIC
-# ============================================================================
-
-def detect_transfer_intent(text: str, llm_response: str) -> bool:
-    """
-    Detect if user is requesting to speak to a human.
-    
-    Args:
-        text: User's input text (in English)
-        llm_response: LLM's response
-        
-    Returns:
-        True if transfer is requested
-        
-    Example:
-        >>> detect_transfer_intent("I want to speak to a manager", "...")
-        True
-    """
-    # Combine user text and LLM response for comprehensive detection
-    combined = f"{text.lower()} {llm_response.lower()}"
-    
-    # Transfer keywords and phrases
-    transfer_phrases = [
-        "speak to human",
-        "talk to human",
-        "speak to someone",
-        "talk to someone",
-        "speak to manager",
-        "talk to manager",
-        "speak to a person",
-        "talk to a person",
-        "transfer me",
-        "connect me",
-        "real person",
-        "actual person",
-        "live agent",
-        "customer service",
-        "support team",
-        "representative",
-        "operator",
-        "staff member",
-        "team member",
-        "human help",
-        "human support"
-    ]
-    
-    # Check for transfer phrases in user input
-    user_lower = text.lower()
-    for phrase in transfer_phrases:
-        if phrase in user_lower:
-            logger.info(f"Transfer intent detected: '{phrase}' in user input")
-            return True
-    
-    # Check if LLM is offering to transfer
-    llm_transfer_indicators = [
-        "transfer you",
-        "connect you",
-        "speak with a",
-        "talk with a",
-        "representative",
-        "team member"
-    ]
-    
-    llm_lower = llm_response.lower()
-    for indicator in llm_transfer_indicators:
-        if indicator in llm_lower:
-            logger.info(f"Transfer offer detected in LLM response: '{indicator}'")
-            return True
-    
-    return False
-
-
-async def request_call_transfer(
-    call_id: str,
-    reason: str = "Customer requested human assistance"
-) -> Dict[str, Any]:
-    """
-    Request a call transfer to human agent.
-    
-    This function:
-    1. Updates call state to prevent further AI responses
-    2. Logs transfer request
-    3. Returns transfer parameters for websocket_server
-    
-    Args:
-        call_id: Call identifier
-        reason: Reason for transfer
-        
-    Returns:
-        Dictionary with transfer details
-        
-    Raises:
-        RuntimeError: If transfer cannot be initiated
-        
-    Example:
-        >>> result = await request_call_transfer("CA123", "Customer request")
-    """
     try:
-        # Get memory
-        memory = get_memory(call_id)
-        if not memory:
-            raise RuntimeError(f"No active call found: {call_id}")
+        # Parse for order modifications
+        # Simple keyword detection (can be enhanced with structured outputs)
         
-        # Check if transfer is enabled
-        from config import is_feature_enabled
+        response_lower = ai_response.lower()
+        
+        # Check for order confirmation
+        if "confirm" in response_lower or "place the order" in response_lower:
+            actions["confirm_order"] = True
+        
+        # Check for ending call
+        if "goodbye" in response_lower or "thank you for calling" in response_lower:
+            actions["end_call"] = True
+        
+        return actions
+        
+    except Exception as e:
+        logger.error(f"Error processing AI response: {str(e)}")
+        return {}
+
+
+def _detect_transfer_intent(user_text: str, ai_response: str) -> bool:
+    """Detect if transfer to human is requested."""
+    combined = f"{user_text.lower()} {ai_response.lower()}"
+    
+    transfer_keywords = [
+        "speak to human", "talk to human", "speak to manager", "talk to manager",
+        "transfer me", "connect me", "real person", "live agent",
+        "customer service", "support", "representative", "operator"
+    ]
+    
+    return any(keyword in combined for keyword in transfer_keywords)
+
+
+async def _request_call_transfer(call_id: str, reason: str) -> Dict[str, Any]:
+    """Request call transfer."""
+    try:
+        from config import get_config, is_feature_enabled
+        
         if not is_feature_enabled("call_transfer"):
-            logger.warning(f"Transfer requested but feature disabled: {call_id}")
             return {
                 "transfer_requested": False,
-                "reason": "Transfer feature is disabled"
+                "reason": "Transfer feature disabled"
             }
         
-        # Get transfer number from config
-        from config import get_config
-        transfer_number = get_config().twilio.human_transfer_number
+        config = get_config()
+        transfer_number = config.twilio.human_transfer_number
         
         if not transfer_number:
-            logger.error("Transfer requested but HUMAN_TRANSFER_NUMBER not configured")
             raise RuntimeError("Transfer number not configured")
         
-        # Update call state
-        memory.set_state("transfer_requested")
+        session = _active_sessions.get(call_id)
+        if session:
+            session.transition(CallState.TRANSFERRING)
         
-        # Log transfer event
-        logger.info(
-            f"Call transfer requested: {call_id} - Reason: {reason}"
-        )
+        memory = get_memory(call_id)
+        if memory:
+            memory.set_state("transfer_requested")
+            memory.add_conversation_turn(
+                role="system",
+                content=f"Transfer requested: {reason}",
+                intent="transfer"
+            )
         
-        # Store transfer info in memory
-        memory.add_conversation_turn(
-            role="system",
-            content=f"Transfer requested: {reason}",
-            intent="transfer"
-        )
-        
-        # Log to database
-        try:
-            db.store_call_log({
-                "restaurant_id": memory.restaurant_id,
-                "caller_phone": memory.customer_phone or "unknown",
-                "call_sid": call_id,
-                "direction": "inbound",
-                "status": "transferring",
-                "transcript": f"Transfer requested: {reason}"
-            })
-        except Exception as e:
-            logger.error(f"Failed to log transfer to database: {str(e)}")
+        logger.info(f"Transfer requested for {call_id}: {reason}")
         
         return {
             "transfer_requested": True,
@@ -799,114 +686,46 @@ async def request_call_transfer(
         }
         
     except Exception as e:
-        logger.error(f"Failed to request transfer: {str(e)}", exc_info=True)
-        raise RuntimeError(f"Transfer request failed: {str(e)}")
+        logger.error(f"Transfer request error: {str(e)}")
+        raise
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def get_call_status(call_id: str) -> Dict[str, Any]:
-    """
-    Get current status of a call.
+def _fallback_response(session: Optional[CallSession]) -> Dict[str, Any]:
+    """Generate fallback response on error."""
+    language = session.detected_language if session else "en"
     
-    Args:
-        call_id: Call identifier
-        
-    Returns:
-        Call status information
-    """
-    memory = get_memory(call_id)
-    
-    if not memory:
-        return {
-            "active": False,
-            "call_id": call_id
-        }
-    
-    try:
-        order_summary = get_order_summary(call_id)
-        
-        return {
-            "active": True,
-            "call_id": call_id,
-            "restaurant_id": memory.restaurant_id,
-            "state": memory.state,
-            "language": memory.detected_language,
-            "turn_count": memory.turn_count,
-            "order_item_count": order_summary["item_count"],
-            "order_total": order_summary["total"],
-            "duration_seconds": int(
-                (datetime.utcnow() - memory.call_start_time).total_seconds()
-            )
-        }
-    except:
-        return {
-            "active": True,
-            "call_id": call_id,
-            "error": "Could not retrieve full status"
-        }
+    return {
+        "response_text": "I apologize, but I'm having trouble understanding. Could you please repeat that?",
+        "language": language,
+        "actions": {}
+    }
 
 
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
+def get_session_state(call_id: str) -> Optional[str]:
+    """Get current state of call session."""
+    session = _active_sessions.get(call_id)
+    return session.state.value if session else None
+
+
+def get_active_sessions() -> List[str]:
+    """Get list of active session IDs."""
+    return list(_active_sessions.keys())
+
 
 if __name__ == "__main__":
-    """
-    Example usage of the main orchestrator.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
     async def example():
-        print("Main AI Orchestrator Example")
+        print("Main AI Orchestrator")
         print("=" * 50)
+        print("\nCall Lifecycle States:")
+        for state in CallState:
+            print(f"  - {state.value}")
         
-        # Configuration
-        print("\nConfiguration:")
-        print(f"AI Provider: {AI_PROVIDER}")
-        print(f"Model: {CLAUDE_MODEL if AI_PROVIDER == 'claude' else OPENAI_MODEL}")
-        
-        # Simulate a call
-        call_id = "CA123example"
-        restaurant_id = "rest_123"
-        
-        try:
-            # 1. Start call
-            print("\n1. Starting call...")
-            start_result = await handle_call_start(call_id, restaurant_id)
-            print(f"   ✓ Call initialized")
-            print(f"   - Menu items: {start_result['menu_items']}")
-            
-            # 2. Process user input
-            print("\n2. Processing user input...")
-            user_texts = [
-                "Hi, I'd like to order a pizza",
-                "I'll have a large pepperoni pizza",
-                "That's all, thank you"
-            ]
-            
-            for i, text in enumerate(user_texts, 1):
-                print(f"\n   Turn {i}:")
-                print(f"   User: {text}")
-                
-                # Note: This would fail without proper API keys
-                # result = await handle_user_text(text, call_id)
-                # print(f"   Assistant: {result['response_text']}")
-                
-                print(f"   (Skipped - requires API key)")
-            
-            # 3. End call
-            print("\n3. Ending call...")
-            end_result = await handle_call_end(call_id)
-            print(f"   ✓ Call ended")
-            print(f"   - Total turns: {end_result['total_turns']}")
-            print(f"   - Order finalized: {end_result['order_finalized']}")
-            
-        except Exception as e:
-            print(f"\n✗ Error: {e}")
-            # Clean up
-            clear_memory(call_id)
+        print("\n" + "=" * 50)
+        print("Production-ready call orchestrator")
     
-    # Run example
     asyncio.run(example())
