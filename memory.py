@@ -1,177 +1,247 @@
 """
-In-Call Memory Engine
-=====================
-Manages temporary state for active voice calls.
-Pure in-memory storage - no persistence, no database.
+In-Call Memory Engine (Production)
+===================================
+Structured memory management with explicit lifecycle.
+Per-call isolation, history trimming, memory caps, summarization hooks.
+Only main.py may write to memory - strict ownership enforcement.
 """
 
-from typing import Dict, List, Optional, Any
+import logging
+from typing import Dict, List, Any, Optional
 from datetime import datetime
-from threading import Lock
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryState(Enum):
+    """Memory lifecycle states."""
+    CREATED = "created"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    CLOSED = "closed"
+
+
+@dataclass
+class ConversationTurn:
+    """Single conversation turn."""
+    role: str  # "user" or "assistant"
+    content: str
+    intent: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MemorySnapshot:
+    """Point-in-time memory snapshot."""
+    call_id: str
+    restaurant_id: str
+    state: str
+    facts: Dict[str, Any]
+    flags: Dict[str, bool]
+    slots: Dict[str, Any]
+    turns: List[ConversationTurn]
+    error_count: int
+    created_at: str
+    updated_at: str
+    turn_count: int
 
 
 class CallMemory:
     """
-    In-memory storage for a single call's state.
-    Stores all temporary data needed during an active conversation.
+    Structured in-call memory with lifecycle management.
+    Supports facts, flags, slots, conversation turns, and error tracking.
     """
     
-    def __init__(self, call_id: str):
+    def __init__(self, call_id: str, restaurant_id: str):
         """
-        Initialize memory for a specific call.
+        Initialize call memory.
         
         Args:
-            call_id: Unique identifier for the call
+            call_id: Unique call identifier
+            restaurant_id: Restaurant identifier
         """
         self.call_id = call_id
+        self.restaurant_id = restaurant_id
+        self.state = MemoryState.CREATED
+        
+        # Structured memory components
+        self.facts: Dict[str, Any] = {}  # Immutable facts (customer name, etc.)
+        self.flags: Dict[str, bool] = {}  # Boolean flags (upsell_offered, etc.)
+        self.slots: Dict[str, Any] = {}  # Mutable slots (current_item, etc.)
+        self.turns: List[ConversationTurn] = []  # Conversation history
+        self.errors: List[str] = []  # Error log
+        
+        # Menu snapshot (set once, never modified)
+        self._menu_snapshot: Optional[Dict[str, Any]] = None
+        self._menu_locked = False
+        
+        # Lifecycle tracking
         self.created_at = datetime.utcnow()
         self.updated_at = datetime.utcnow()
         
-        # Core memory fields
-        self.detected_language: Optional[str] = None
-        self.menu_snapshot: List[Dict[str, Any]] = []
-        self.current_order: Dict[str, Any] = {
-            "items": [],
-            "total": 0.0,
-            "tax": 0.0,
-            "subtotal": 0.0
-        }
-        self.last_intent: Optional[str] = None
-        self.conversation_context: List[Dict[str, Any]] = []
+        # Caps
+        self.max_turns = 200
+        self.max_errors = 50
+        self.max_facts = 100
+        self.max_flags = 50
+        self.max_slots = 50
         
-        # Additional useful fields
-        self.customer_phone: Optional[str] = None
-        self.customer_name: Optional[str] = None
-        self.restaurant_id: Optional[str] = None
-        self.call_start_time: datetime = datetime.utcnow()
-        
-        # State tracking
-        self.state: str = "initialized"  # initialized, active, completed, failed
-        self.turn_count: int = 0
-        
-        # Lock for thread-safe updates
-        self._lock = Lock()
+        logger.info(f"Memory created for call {call_id}")
     
-    def update_language(self, language: str) -> None:
-        """
-        Update detected language.
-        
-        Args:
-            language: Language code (e.g., 'en', 'es', 'fr')
-        """
-        with self._lock:
-            self.detected_language = language
+    # ========================================================================
+    # LIFECYCLE MANAGEMENT
+    # ========================================================================
+    
+    def activate(self):
+        """Transition to active state."""
+        if self.state == MemoryState.CREATED:
+            self.state = MemoryState.ACTIVE
             self._touch()
+            logger.info(f"Memory activated for {self.call_id}")
     
-    def set_menu_snapshot(self, menu: List[Dict[str, Any]]) -> None:
-        """
-        Store menu snapshot for this call.
-        
-        Args:
-            menu: List of menu item dictionaries
-        """
-        with self._lock:
-            self.menu_snapshot = menu.copy()
+    def suspend(self):
+        """Suspend memory (pause call)."""
+        if self.state == MemoryState.ACTIVE:
+            self.state = MemoryState.SUSPENDED
             self._touch()
+            logger.info(f"Memory suspended for {self.call_id}")
     
-    def add_order_item(
-        self, 
-        item_id: str, 
-        name: str,
-        quantity: int = 1,
-        price: float = 0.0,
-        customizations: Optional[List[str]] = None
-    ) -> None:
-        """
-        Add item to current order.
-        
-        Args:
-            item_id: Unique identifier for menu item
-            name: Item name
-            quantity: Number of items
-            price: Price per item
-            customizations: List of customizations/modifications
-        """
-        with self._lock:
-            order_item = {
-                "item_id": item_id,
-                "name": name,
-                "quantity": quantity,
-                "price": price,
-                "customizations": customizations or [],
-                "added_at": datetime.utcnow().isoformat()
-            }
-            self.current_order["items"].append(order_item)
-            self._recalculate_totals()
+    def close(self):
+        """Close memory (end call)."""
+        if self.state != MemoryState.CLOSED:
+            self.state = MemoryState.CLOSED
             self._touch()
+            logger.info(
+                f"Memory closed for {self.call_id}: "
+                f"{len(self.turns)} turns, {len(self.errors)} errors"
+            )
     
-    def remove_order_item(self, item_id: str) -> bool:
+    def is_active(self) -> bool:
+        """Check if memory is active."""
+        return self.state == MemoryState.ACTIVE
+    
+    def is_closed(self) -> bool:
+        """Check if memory is closed."""
+        return self.state == MemoryState.CLOSED
+    
+    def _touch(self):
+        """Update timestamp."""
+        self.updated_at = datetime.utcnow()
+    
+    # ========================================================================
+    # FACTS (Immutable)
+    # ========================================================================
+    
+    def set_fact(self, key: str, value: Any) -> bool:
         """
-        Remove item from current order.
+        Set immutable fact (write-once).
         
         Args:
-            item_id: ID of item to remove
+            key: Fact key
+            value: Fact value
             
         Returns:
-            True if item was removed, False if not found
+            True if set, False if already exists
         """
-        with self._lock:
-            original_length = len(self.current_order["items"])
-            self.current_order["items"] = [
-                item for item in self.current_order["items"]
-                if item["item_id"] != item_id
-            ]
-            removed = len(self.current_order["items"]) < original_length
-            if removed:
-                self._recalculate_totals()
-                self._touch()
-            return removed
-    
-    def update_order_item_quantity(
-        self, 
-        item_id: str, 
-        quantity: int
-    ) -> bool:
-        """
-        Update quantity for an item in the order.
-        
-        Args:
-            item_id: ID of item to update
-            quantity: New quantity
-            
-        Returns:
-            True if updated, False if item not found
-        """
-        with self._lock:
-            for item in self.current_order["items"]:
-                if item["item_id"] == item_id:
-                    item["quantity"] = quantity
-                    self._recalculate_totals()
-                    self._touch()
-                    return True
+        if key in self.facts:
+            logger.warning(f"Fact '{key}' already set, ignoring update")
             return False
+        
+        if len(self.facts) >= self.max_facts:
+            logger.warning(f"Max facts reached ({self.max_facts})")
+            return False
+        
+        self.facts[key] = value
+        self._touch()
+        logger.debug(f"Fact set: {key}={value}")
+        return True
     
-    def clear_order(self) -> None:
-        """Clear all items from current order."""
-        with self._lock:
-            self.current_order = {
-                "items": [],
-                "total": 0.0,
-                "tax": 0.0,
-                "subtotal": 0.0
-            }
-            self._touch()
+    def get_fact(self, key: str, default: Any = None) -> Any:
+        """Get fact value."""
+        return self.facts.get(key, default)
     
-    def set_last_intent(self, intent: str) -> None:
+    def has_fact(self, key: str) -> bool:
+        """Check if fact exists."""
+        return key in self.facts
+    
+    def get_all_facts(self) -> Dict[str, Any]:
+        """Get all facts."""
+        return self.facts.copy()
+    
+    # ========================================================================
+    # FLAGS (Boolean state)
+    # ========================================================================
+    
+    def set_flag(self, key: str, value: bool = True):
         """
-        Record the last detected user intent.
+        Set boolean flag.
         
         Args:
-            intent: Intent name (e.g., 'add_item', 'remove_item', 'checkout')
+            key: Flag key
+            value: Flag value (default: True)
         """
-        with self._lock:
-            self.last_intent = intent
+        if len(self.flags) >= self.max_flags and key not in self.flags:
+            logger.warning(f"Max flags reached ({self.max_flags})")
+            return
+        
+        self.flags[key] = value
+        self._touch()
+        logger.debug(f"Flag set: {key}={value}")
+    
+    def get_flag(self, key: str, default: bool = False) -> bool:
+        """Get flag value."""
+        return self.flags.get(key, default)
+    
+    def toggle_flag(self, key: str):
+        """Toggle flag value."""
+        self.flags[key] = not self.flags.get(key, False)
+        self._touch()
+    
+    def get_all_flags(self) -> Dict[str, bool]:
+        """Get all flags."""
+        return self.flags.copy()
+    
+    # ========================================================================
+    # SLOTS (Mutable state)
+    # ========================================================================
+    
+    def set_slot(self, key: str, value: Any):
+        """
+        Set mutable slot.
+        
+        Args:
+            key: Slot key
+            value: Slot value
+        """
+        if len(self.slots) >= self.max_slots and key not in self.slots:
+            logger.warning(f"Max slots reached ({self.max_slots})")
+            return
+        
+        self.slots[key] = value
+        self._touch()
+        logger.debug(f"Slot set: {key}={value}")
+    
+    def get_slot(self, key: str, default: Any = None) -> Any:
+        """Get slot value."""
+        return self.slots.get(key, default)
+    
+    def clear_slot(self, key: str):
+        """Clear slot value."""
+        if key in self.slots:
+            del self.slots[key]
             self._touch()
+    
+    def get_all_slots(self) -> Dict[str, Any]:
+        """Get all slots."""
+        return self.slots.copy()
+    
+    # ========================================================================
+    # CONVERSATION TURNS
+    # ========================================================================
     
     def add_conversation_turn(
         self,
@@ -179,471 +249,329 @@ class CallMemory:
         content: str,
         intent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+    ):
         """
-        Add a conversation turn to context.
+        Add conversation turn.
         
         Args:
-            role: Speaker role ('user' or 'assistant')
-            content: What was said
-            intent: Detected intent for this turn
-            metadata: Additional turn metadata
+            role: "user" or "assistant"
+            content: Turn content
+            intent: Intent classification (optional)
+            metadata: Additional metadata (optional)
         """
-        with self._lock:
-            turn = {
-                "role": role,
-                "content": content,
-                "intent": intent,
-                "metadata": metadata or {},
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            self.conversation_context.append(turn)
-            self.turn_count += 1
-            self._touch()
+        if role not in ["user", "assistant", "system"]:
+            logger.warning(f"Invalid role: {role}")
+            return
+        
+        turn = ConversationTurn(
+            role=role,
+            content=content,
+            intent=intent,
+            metadata=metadata or {}
+        )
+        
+        self.turns.append(turn)
+        self._touch()
+        
+        # Auto-trim if needed
+        if len(self.turns) > self.max_turns:
+            self._trim_turns()
+        
+        logger.debug(f"Turn added: {role} ({len(content)} chars)")
     
-    def get_recent_context(self, num_turns: int = 5) -> List[Dict[str, Any]]:
+    def get_conversation_history(self, last_n: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        Get recent conversation turns.
+        Get conversation history.
         
         Args:
-            num_turns: Number of recent turns to retrieve
+            last_n: Return only last N turns (optional)
             
         Returns:
-            List of recent conversation turns
+            List of turn dictionaries
         """
-        with self._lock:
-            return self.conversation_context[-num_turns:] if self.conversation_context else []
+        turns = self.turns[-last_n:] if last_n else self.turns
+        return [asdict(turn) for turn in turns]
     
-    def set_customer_info(
-        self, 
-        phone: Optional[str] = None,
-        name: Optional[str] = None
-    ) -> None:
-        """
-        Set customer information.
+    def get_turn_count(self) -> int:
+        """Get total turn count."""
+        return len(self.turns)
+    
+    def get_user_turns(self) -> List[Dict[str, Any]]:
+        """Get only user turns."""
+        return [asdict(t) for t in self.turns if t.role == "user"]
+    
+    def get_assistant_turns(self) -> List[Dict[str, Any]]:
+        """Get only assistant turns."""
+        return [asdict(t) for t in self.turns if t.role == "assistant"]
+    
+    def _trim_turns(self):
+        """Trim conversation history (keep recent turns)."""
+        keep_count = int(self.max_turns * 0.75)  # Keep 75%
+        removed_count = len(self.turns) - keep_count
         
-        Args:
-            phone: Customer phone number
-            name: Customer name
-        """
-        with self._lock:
-            if phone:
-                self.customer_phone = phone
-            if name:
-                self.customer_name = name
-            self._touch()
+        if removed_count > 0:
+            self.turns = self.turns[-keep_count:]
+            logger.info(f"Trimmed {removed_count} old turns from {self.call_id}")
     
-    def set_restaurant_id(self, restaurant_id: str) -> None:
+    def get_summary_hook_data(self) -> Dict[str, Any]:
         """
-        Set restaurant ID for this call.
-        
-        Args:
-            restaurant_id: Restaurant identifier
-        """
-        with self._lock:
-            self.restaurant_id = restaurant_id
-            self._touch()
-    
-    def set_state(self, state: str) -> None:
-        """
-        Update call state.
-        
-        Args:
-            state: New state (initialized, active, completed, failed)
-        """
-        with self._lock:
-            self.state = state
-            self._touch()
-    
-    def get_order_summary(self) -> Dict[str, Any]:
-        """
-        Get current order summary.
+        Get data for conversation summarization.
+        To be used by external summarization service.
         
         Returns:
-            Dictionary with order details and totals
+            Dictionary with summarizable data
         """
-        with self._lock:
-            return {
-                "items": self.current_order["items"].copy(),
-                "subtotal": self.current_order["subtotal"],
-                "tax": self.current_order["tax"],
-                "total": self.current_order["total"],
-                "item_count": len(self.current_order["items"])
-            }
+        return {
+            "call_id": self.call_id,
+            "turn_count": len(self.turns),
+            "user_turns": [t.content for t in self.turns if t.role == "user"],
+            "assistant_turns": [t.content for t in self.turns if t.role == "assistant"],
+            "intents": [t.intent for t in self.turns if t.intent],
+            "facts": self.facts,
+            "flags": self.flags
+        }
+    
+    # ========================================================================
+    # ERROR TRACKING
+    # ========================================================================
+    
+    def log_error(self, error_msg: str):
+        """
+        Log error.
+        
+        Args:
+            error_msg: Error message
+        """
+        if len(self.errors) >= self.max_errors:
+            # Trim oldest errors
+            self.errors = self.errors[-int(self.max_errors * 0.75):]
+        
+        timestamp = datetime.utcnow().isoformat()
+        self.errors.append(f"[{timestamp}] {error_msg}")
+        self._touch()
+        
+        logger.warning(f"Error logged for {self.call_id}: {error_msg}")
+    
+    def get_error_count(self) -> int:
+        """Get error count."""
+        return len(self.errors)
+    
+    def get_errors(self) -> List[str]:
+        """Get all errors."""
+        return self.errors.copy()
+    
+    def clear_errors(self):
+        """Clear error log."""
+        self.errors.clear()
+        self._touch()
+    
+    # ========================================================================
+    # MENU SNAPSHOT (Write-once)
+    # ========================================================================
+    
+    def set_menu_snapshot(self, menu: Dict[str, Any]):
+        """
+        Set menu snapshot (write-once).
+        
+        Args:
+            menu: Menu data
+        """
+        if self._menu_locked:
+            logger.warning(f"Menu already set for {self.call_id}, ignoring update")
+            return
+        
+        self._menu_snapshot = menu
+        self._menu_locked = True
+        self._touch()
+        logger.info(f"Menu snapshot set for {self.call_id}")
+    
+    def get_menu_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Get menu snapshot."""
+        return self._menu_snapshot
+    
+    def has_menu(self) -> bool:
+        """Check if menu is set."""
+        return self._menu_snapshot is not None
+    
+    # ========================================================================
+    # STATE MANAGEMENT
+    # ========================================================================
+    
+    def set_state(self, state_key: str, state_value: Any = True):
+        """
+        Set arbitrary state (convenience wrapper for slots).
+        
+        Args:
+            state_key: State key
+            state_value: State value
+        """
+        self.set_slot(state_key, state_value)
+    
+    def get_state(self, state_key: str, default: Any = None) -> Any:
+        """Get arbitrary state."""
+        return self.get_slot(state_key, default)
+    
+    # ========================================================================
+    # SNAPSHOT
+    # ========================================================================
+    
+    def snapshot(self) -> MemorySnapshot:
+        """
+        Create point-in-time snapshot.
+        
+        Returns:
+            MemorySnapshot instance
+        """
+        return MemorySnapshot(
+            call_id=self.call_id,
+            restaurant_id=self.restaurant_id,
+            state=self.state.value,
+            facts=self.facts.copy(),
+            flags=self.flags.copy(),
+            slots=self.slots.copy(),
+            turns=self.turns.copy(),
+            error_count=len(self.errors),
+            created_at=self.created_at.isoformat(),
+            updated_at=self.updated_at.isoformat(),
+            turn_count=len(self.turns)
+        )
     
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert memory to dictionary for serialization.
-        
-        Returns:
-            Dictionary representation of call memory
-        """
-        with self._lock:
-            return {
-                "call_id": self.call_id,
-                "created_at": self.created_at.isoformat(),
-                "updated_at": self.updated_at.isoformat(),
-                "detected_language": self.detected_language,
-                "menu_snapshot": self.menu_snapshot.copy(),
-                "current_order": {
-                    "items": self.current_order["items"].copy(),
-                    "subtotal": self.current_order["subtotal"],
-                    "tax": self.current_order["tax"],
-                    "total": self.current_order["total"]
-                },
-                "last_intent": self.last_intent,
-                "conversation_context": self.conversation_context.copy(),
-                "customer_phone": self.customer_phone,
-                "customer_name": self.customer_name,
-                "restaurant_id": self.restaurant_id,
-                "state": self.state,
-                "turn_count": self.turn_count,
-                "call_start_time": self.call_start_time.isoformat()
-            }
-    
-    def _recalculate_totals(self) -> None:
-        """Recalculate order totals based on items (internal use)."""
-        subtotal = sum(
-            item["price"] * item["quantity"]
-            for item in self.current_order["items"]
-        )
-        tax = subtotal * 0.08  # Default 8% tax, should come from restaurant settings
-        total = subtotal + tax
-        
-        self.current_order["subtotal"] = round(subtotal, 2)
-        self.current_order["tax"] = round(tax, 2)
-        self.current_order["total"] = round(total, 2)
-    
-    def _touch(self) -> None:
-        """Update the last modified timestamp (internal use)."""
-        self.updated_at = datetime.utcnow()
+        """Convert to dictionary."""
+        return asdict(self.snapshot())
 
 
-class MemoryStore:
+# ============================================================================
+# GLOBAL MEMORY STORE (Per-Call Isolation)
+# ============================================================================
+
+_memory_store: Dict[str, CallMemory] = {}
+
+
+def create_call_memory(call_id: str, restaurant_id: str) -> CallMemory:
     """
-    Global store for managing all active call memories.
-    Provides per-call isolation with thread-safe access.
-    """
-    
-    def __init__(self):
-        """Initialize the memory store."""
-        self._memories: Dict[str, CallMemory] = {}
-        self._lock = Lock()
-    
-    def create_call_memory(self, call_id: str) -> CallMemory:
-        """
-        Create a new call memory instance.
-        
-        Args:
-            call_id: Unique identifier for the call
-            
-        Returns:
-            New CallMemory instance
-            
-        Raises:
-            ValueError: If call_id already exists
-        """
-        with self._lock:
-            if call_id in self._memories:
-                raise ValueError(f"Memory for call_id '{call_id}' already exists")
-            
-            memory = CallMemory(call_id)
-            self._memories[call_id] = memory
-            return memory
-    
-    def get_memory(self, call_id: str) -> Optional[CallMemory]:
-        """
-        Retrieve memory for a specific call.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            CallMemory instance or None if not found
-        """
-        with self._lock:
-            return self._memories.get(call_id)
-    
-    def clear_memory(self, call_id: str) -> bool:
-        """
-        Clear and remove memory for a call.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            True if memory was cleared, False if not found
-        """
-        with self._lock:
-            if call_id in self._memories:
-                del self._memories[call_id]
-                return True
-            return False
-    
-    def get_or_create(self, call_id: str) -> CallMemory:
-        """
-        Get existing memory or create new one if doesn't exist.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            CallMemory instance (existing or new)
-        """
-        with self._lock:
-            if call_id not in self._memories:
-                self._memories[call_id] = CallMemory(call_id)
-            return self._memories[call_id]
-    
-    def list_active_calls(self) -> List[str]:
-        """
-        Get list of all active call IDs.
-        
-        Returns:
-            List of call IDs with active memory
-        """
-        with self._lock:
-            return list(self._memories.keys())
-    
-    def clear_all(self) -> int:
-        """
-        Clear all call memories (use with caution).
-        
-        Returns:
-            Number of memories cleared
-        """
-        with self._lock:
-            count = len(self._memories)
-            self._memories.clear()
-            return count
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the memory store.
-        
-        Returns:
-            Dictionary with store statistics
-        """
-        with self._lock:
-            return {
-                "active_calls": len(self._memories),
-                "call_ids": list(self._memories.keys()),
-                "total_turns": sum(
-                    mem.turn_count for mem in self._memories.values()
-                )
-            }
-
-
-# ============================================================================
-# SINGLETON INSTANCE
-# ============================================================================
-
-# Global memory store instance
-_store = MemoryStore()
-
-
-# ============================================================================
-# PUBLIC API
-# ============================================================================
-
-def create_call_memory(call_id: str) -> CallMemory:
-    """
-    Create a new call memory instance.
+    Create new call memory.
     
     Args:
-        call_id: Unique identifier for the call
+        call_id: Call identifier
+        restaurant_id: Restaurant identifier
         
     Returns:
-        New CallMemory instance
-        
-    Example:
-        >>> memory = create_call_memory("CA123abc")
-        >>> memory.set_restaurant_id("rest_123")
+        CallMemory instance
     """
-    return _store.create_call_memory(call_id)
+    if call_id in _memory_store:
+        logger.warning(f"Memory already exists for {call_id}, returning existing")
+        return _memory_store[call_id]
+    
+    memory = CallMemory(call_id, restaurant_id)
+    memory.activate()
+    _memory_store[call_id] = memory
+    
+    logger.info(f"Created memory for call {call_id}")
+    return memory
 
 
 def get_memory(call_id: str) -> Optional[CallMemory]:
     """
-    Retrieve memory for a specific call.
+    Get call memory.
     
     Args:
         call_id: Call identifier
         
     Returns:
-        CallMemory instance or None if not found
-        
-    Example:
-        >>> memory = get_memory("CA123abc")
-        >>> if memory:
-        >>>     memory.add_order_item("pizza_1", "Margherita Pizza", 1, 12.99)
+        CallMemory instance or None
     """
-    return _store.get_memory(call_id)
+    return _memory_store.get(call_id)
 
 
-def clear_memory(call_id: str) -> bool:
+def clear_memory(call_id: str):
     """
-    Clear and remove memory for a call.
-    Should be called when call ends.
+    Clear call memory (cleanup).
     
     Args:
         call_id: Call identifier
-        
-    Returns:
-        True if memory was cleared, False if not found
-        
-    Example:
-        >>> clear_memory("CA123abc")
-        True
     """
-    return _store.clear_memory(call_id)
-
-
-def get_or_create_memory(call_id: str) -> CallMemory:
-    """
-    Get existing memory or create new one if doesn't exist.
-    Convenience function for simple workflows.
+    memory = _memory_store.pop(call_id, None)
     
-    Args:
-        call_id: Call identifier
-        
-    Returns:
-        CallMemory instance
-        
-    Example:
-        >>> memory = get_or_create_memory("CA123abc")
-    """
-    return _store.get_or_create(call_id)
+    if memory:
+        memory.close()
+        logger.info(f"Cleared memory for call {call_id}")
 
 
-def list_active_calls() -> List[str]:
+def get_active_memories() -> List[str]:
     """
-    Get list of all active call IDs.
+    Get list of active memory call IDs.
     
     Returns:
-        List of call IDs with active memory
-        
-    Example:
-        >>> active = list_active_calls()
-        >>> print(f"Active calls: {len(active)}")
+        List of call IDs
     """
-    return _store.list_active_calls()
+    return list(_memory_store.keys())
 
 
-def get_stats() -> Dict[str, Any]:
-    """
-    Get statistics about the memory store.
+def get_memory_count() -> int:
+    """Get count of active memories."""
+    return len(_memory_store)
+
+
+def clear_all_memories():
+    """Clear all memories (for testing/cleanup)."""
+    count = len(_memory_store)
     
-    Returns:
-        Dictionary with store statistics
-        
-    Example:
-        >>> stats = get_stats()
-        >>> print(f"Active calls: {stats['active_calls']}")
-    """
-    return _store.get_stats()
+    for memory in _memory_store.values():
+        memory.close()
+    
+    _memory_store.clear()
+    logger.info(f"Cleared all {count} memories")
 
-
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
 
 if __name__ == "__main__":
-    """
-    Example usage of the memory engine.
-    """
-    
-    # Create memory for new call
-    call_id = "CA123abc456def"
-    memory = create_call_memory(call_id)
-    
-    # Set restaurant
-    memory.set_restaurant_id("rest_123")
-    
-    # Set customer info
-    memory.set_customer_info(phone="+1234567890", name="John Doe")
-    
-    # Detect language
-    memory.update_language("en")
-    
-    # Store menu snapshot
-    memory.set_menu_snapshot([
-        {"id": "pizza_1", "name": "Margherita", "price": 12.99},
-        {"id": "pizza_2", "name": "Pepperoni", "price": 14.99}
-    ])
-    
-    # Track conversation
-    memory.add_conversation_turn(
-        role="user",
-        content="I'd like to order a pizza",
-        intent="start_order"
-    )
-    memory.set_last_intent("start_order")
-    
-    memory.add_conversation_turn(
-        role="assistant",
-        content="Great! What type of pizza would you like?",
-        intent=None
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    memory.add_conversation_turn(
-        role="user",
-        content="I'll have a Margherita pizza",
-        intent="add_item"
-    )
-    memory.set_last_intent("add_item")
+    print("In-Call Memory Engine (Production)")
+    print("=" * 50)
     
-    # Add items to order
-    memory.add_order_item(
-        item_id="pizza_1",
-        name="Margherita Pizza",
-        quantity=1,
-        price=12.99,
-        customizations=["extra cheese"]
-    )
+    # Create memory
+    call_id = "test_call_123"
+    memory = create_call_memory(call_id, "rest_001")
     
-    memory.add_order_item(
-        item_id="drink_1",
-        name="Coke",
-        quantity=2,
-        price=2.50
-    )
+    print(f"\nMemory created: {call_id}")
+    print(f"State: {memory.state.value}")
     
-    # Get order summary
-    summary = memory.get_order_summary()
-    print(f"\nOrder Summary:")
-    print(f"Items: {summary['item_count']}")
-    print(f"Subtotal: ${summary['subtotal']:.2f}")
-    print(f"Tax: ${summary['tax']:.2f}")
-    print(f"Total: ${summary['total']:.2f}")
+    # Set facts
+    memory.set_fact("customer_name", "John")
+    memory.set_fact("customer_phone", "+1234567890")
+    print(f"\nFacts: {memory.get_all_facts()}")
     
-    # Get recent context
-    recent = memory.get_recent_context(num_turns=3)
-    print(f"\nRecent conversation ({len(recent)} turns):")
-    for turn in recent:
-        print(f"  {turn['role']}: {turn['content']}")
+    # Set flags
+    memory.set_flag("upsell_offered", True)
+    memory.set_flag("order_confirmed", False)
+    print(f"Flags: {memory.get_all_flags()}")
     
-    # Update order
-    memory.update_order_item_quantity("drink_1", 3)
+    # Set slots
+    memory.set_slot("current_item", "Large Pizza")
+    memory.set_slot("order_total", 15.99)
+    print(f"Slots: {memory.get_all_slots()}")
     
-    # Get updated summary
-    summary = memory.get_order_summary()
-    print(f"\nUpdated Total: ${summary['total']:.2f}")
+    # Add turns
+    memory.add_conversation_turn("user", "I want a large pizza", "order")
+    memory.add_conversation_turn("assistant", "Great! What toppings?", "clarify")
+    memory.add_conversation_turn("user", "Pepperoni and mushrooms", "order_detail")
     
-    # Convert to dict for logging/debugging
-    data = memory.to_dict()
-    print(f"\nMemory state: {data['state']}")
-    print(f"Turn count: {data['turn_count']}")
+    print(f"\nConversation: {memory.get_turn_count()} turns")
     
-    # Retrieve memory later
-    retrieved = get_memory(call_id)
-    if retrieved:
-        print(f"\nRetrieved memory for call: {retrieved.call_id}")
+    # Snapshot
+    snapshot = memory.snapshot()
+    print(f"\nSnapshot created:")
+    print(f"  Turn count: {snapshot.turn_count}")
+    print(f"  Error count: {snapshot.error_count}")
     
-    # Check stats
-    stats = get_stats()
-    print(f"\nActive calls: {stats['active_calls']}")
+    # Cleanup
+    clear_memory(call_id)
+    print(f"\nMemory cleared: {call_id}")
+    print(f"Active memories: {get_memory_count()}")
     
-    # Clean up when call ends
-    cleared = clear_memory(call_id)
-    print(f"\nMemory cleared: {cleared}")
+    print("\n" + "=" * 50)
+    print("Production memory engine ready")
