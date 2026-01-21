@@ -1,575 +1,617 @@
 """
-Menu Access Module
-==================
-Fetch and format restaurant menus for AI voice agent usage.
-Pure data access and formatting - no AI, no audio, no WebSocket logic.
+Menu Module (Production)
+=========================
+Hardened menu management with caching, validation, fallbacks.
+Safe prompt formatting, price normalization, never crashes calls.
 """
 
+import logging
 from typing import Dict, List, Any, Optional
-from db import db
+from datetime import datetime, timedelta
+import asyncio
 
 
-# ============================================================================
-# MENU RETRIEVAL
-# ============================================================================
+logger = logging.getLogger(__name__)
 
-def get_menu(restaurant_id: str) -> Dict[str, Any]:
+
+# Cache configuration
+CACHE_TTL = 300  # 5 minutes
+CACHE_MAX_SIZE = 100
+
+# Validation limits
+MAX_MENU_SIZE = 1000  # Max items per menu
+MAX_ITEM_NAME_LENGTH = 200
+MAX_DESCRIPTION_LENGTH = 500
+
+
+class MenuCache:
+    """Simple TTL-based menu cache."""
+    
+    def __init__(self, ttl: int = CACHE_TTL, max_size: int = CACHE_MAX_SIZE):
+        self.cache: Dict[str, tuple[Dict[str, Any], datetime]] = {}
+        self.ttl = ttl
+        self.max_size = max_size
+    
+    def get(self, restaurant_id: str) -> Optional[Dict[str, Any]]:
+        """Get cached menu if valid."""
+        if restaurant_id not in self.cache:
+            return None
+        
+        menu, timestamp = self.cache[restaurant_id]
+        
+        # Check TTL
+        if datetime.utcnow() - timestamp > timedelta(seconds=self.ttl):
+            del self.cache[restaurant_id]
+            logger.debug(f"Menu cache expired for {restaurant_id}")
+            return None
+        
+        logger.debug(f"Menu cache hit for {restaurant_id}")
+        return menu
+    
+    def set(self, restaurant_id: str, menu: Dict[str, Any]):
+        """Cache menu with TTL."""
+        # Evict oldest if cache full
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+            logger.debug(f"Evicted oldest cache entry: {oldest_key}")
+        
+        self.cache[restaurant_id] = (menu, datetime.utcnow())
+        logger.debug(f"Menu cached for {restaurant_id}")
+    
+    def invalidate(self, restaurant_id: str):
+        """Invalidate cache for restaurant."""
+        if restaurant_id in self.cache:
+            del self.cache[restaurant_id]
+            logger.info(f"Menu cache invalidated for {restaurant_id}")
+    
+    def clear(self):
+        """Clear entire cache."""
+        count = len(self.cache)
+        self.cache.clear()
+        logger.info(f"Menu cache cleared ({count} entries)")
+    
+    def size(self) -> int:
+        """Get cache size."""
+        return len(self.cache)
+
+
+_menu_cache = MenuCache()
+
+
+async def get_menu(restaurant_id: str) -> Dict[str, Any]:
     """
-    Fetch restaurant menu from database.
+    Get menu for restaurant with caching and validation.
     
     Args:
-        restaurant_id: Unique identifier for the restaurant
+        restaurant_id: Restaurant identifier
         
     Returns:
-        Dictionary containing:
-        - items: List of menu items
-        - categories: List of unique categories
-        - item_count: Total number of items
-        - has_items: Boolean indicating if menu has items
-        
-    Raises:
-        ValueError: If restaurant_id is empty
-        Exception: If database fetch fails
+        Validated menu dictionary
         
     Example:
-        >>> menu = get_menu("rest_123")
-        >>> print(f"Menu has {menu['item_count']} items")
+        >>> menu = await get_menu("rest_001")
+        >>> print(menu["items"])
     """
-    # Validate input
-    if not restaurant_id or restaurant_id.strip() == "":
-        raise ValueError("restaurant_id cannot be empty")
+    # Check cache first
+    cached = _menu_cache.get(restaurant_id)
+    if cached:
+        return cached
     
     try:
-        # Fetch menu items from database
-        items = db.fetch_menu(restaurant_id)
+        # Fetch menu from database
+        menu = await _fetch_menu_from_db(restaurant_id)
         
-        # Extract unique categories
-        categories = list(set(
-            item.get("category", "Other")
-            for item in items
-            if item.get("category")
-        ))
-        categories.sort()  # Alphabetical order
+        # Validate menu
+        validated = _validate_menu(menu)
         
-        # Build structured response
-        return {
-            "items": items,
-            "categories": categories,
-            "item_count": len(items),
-            "has_items": len(items) > 0
-        }
+        # Cache validated menu
+        _menu_cache.set(restaurant_id, validated)
         
+        return validated
+    
     except Exception as e:
-        raise Exception(f"Failed to fetch menu for restaurant '{restaurant_id}': {str(e)}")
+        logger.error(f"Error fetching menu for {restaurant_id}: {str(e)}")
+        
+        # Return safe fallback
+        return _get_fallback_menu(restaurant_id)
 
 
-# ============================================================================
-# MENU FORMATTING FOR AI
-# ============================================================================
-
-def format_menu_for_prompt(menu: Dict[str, Any]) -> str:
+async def _fetch_menu_from_db(restaurant_id: str) -> Dict[str, Any]:
     """
-    Format menu into a clean string for AI prompt inclusion.
-    Optimized for LLM context windows and natural conversation.
+    Fetch menu from database.
     
     Args:
-        menu: Menu dictionary from get_menu()
+        restaurant_id: Restaurant identifier
         
     Returns:
-        Formatted menu string ready for AI prompt
-        
-    Example:
-        >>> menu = get_menu("rest_123")
-        >>> prompt_text = format_menu_for_prompt(menu)
-        >>> print(prompt_text)
+        Raw menu data
     """
-    # Handle empty menu
-    if not menu.get("has_items", False):
-        return "No menu items available. Please inform the customer that the menu is currently unavailable."
+    try:
+        from db import db
+        
+        # Run blocking DB call in executor
+        loop = asyncio.get_event_loop()
+        menu = await loop.run_in_executor(
+            None,
+            lambda: db.fetch_menu(restaurant_id)
+        )
+        
+        if not menu:
+            logger.warning(f"No menu found for {restaurant_id}")
+            return _get_fallback_menu(restaurant_id)
+        
+        logger.info(f"Fetched menu for {restaurant_id}: {len(menu.get('items', []))} items")
+        return menu
     
+    except Exception as e:
+        logger.error(f"Database error fetching menu: {str(e)}")
+        return _get_fallback_menu(restaurant_id)
+
+
+def _validate_menu(menu: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate and normalize menu data.
+    
+    Args:
+        menu: Raw menu data
+        
+    Returns:
+        Validated menu data
+    """
+    if not menu or not isinstance(menu, dict):
+        logger.warning("Invalid menu structure")
+        return {"items": [], "categories": []}
+    
+    # Validate items
     items = menu.get("items", [])
+    if not isinstance(items, list):
+        logger.warning("Menu items is not a list")
+        items = []
+    
+    validated_items = []
+    
+    for item in items[:MAX_MENU_SIZE]:  # Enforce size limit
+        try:
+            validated_item = _validate_menu_item(item)
+            if validated_item:
+                validated_items.append(validated_item)
+        except Exception as e:
+            logger.error(f"Error validating menu item: {str(e)}")
+            continue
+    
+    # Validate categories
     categories = menu.get("categories", [])
+    if not isinstance(categories, list):
+        categories = []
     
-    # Build formatted output
-    lines = []
-    lines.append("=== RESTAURANT MENU ===")
-    lines.append("")
+    validated_categories = [
+        cat for cat in categories
+        if isinstance(cat, str) and len(cat) > 0
+    ]
     
-    # Group items by category
-    if categories:
-        for category in categories:
-            # Category header
-            lines.append(f"## {category.upper()}")
-            lines.append("")
-            
-            # Items in this category
-            category_items = [
-                item for item in items
-                if item.get("category") == category
-            ]
-            
-            for item in category_items:
-                lines.append(_format_menu_item(item))
-            
-            lines.append("")  # Spacing between categories
-    else:
-        # No categories - just list all items
-        lines.append("## MENU ITEMS")
-        lines.append("")
-        for item in items:
-            lines.append(_format_menu_item(item))
-    
-    lines.append("=== END MENU ===")
-    
-    return "\n".join(lines)
+    return {
+        "items": validated_items,
+        "categories": validated_categories,
+        "restaurant_id": menu.get("restaurant_id", "unknown"),
+        "validated_at": datetime.utcnow().isoformat()
+    }
 
 
-def _format_menu_item(item: Dict[str, Any]) -> str:
+def _validate_menu_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Format a single menu item for AI consumption.
+    Validate individual menu item.
     
     Args:
-        item: Menu item dictionary
+        item: Menu item data
         
     Returns:
-        Formatted item string
+        Validated item or None if invalid
     """
-    # Extract item details
-    item_id = item.get("id", "unknown")
-    name = item.get("name", "Unnamed Item")
-    price = item.get("price", 0.0)
-    description = item.get("description", "")
+    if not isinstance(item, dict):
+        return None
     
-    # Build item line
-    line = f"- {name} (${price:.2f}) [ID: {item_id}]"
+    # Required fields
+    if "name" not in item or "price" not in item:
+        logger.warning("Menu item missing required fields")
+        return None
     
-    # Add description if available
-    if description and description.strip():
-        line += f"\n  Description: {description.strip()}"
+    name = str(item["name"]).strip()
+    if not name or len(name) > MAX_ITEM_NAME_LENGTH:
+        logger.warning(f"Invalid item name: {name}")
+        return None
     
-    return line
+    # Normalize price
+    price = _normalize_price(item["price"])
+    if price is None:
+        logger.warning(f"Invalid price for item {name}")
+        return None
+    
+    # Optional fields
+    description = str(item.get("description", "")).strip()
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        description = description[:MAX_DESCRIPTION_LENGTH] + "..."
+    
+    category = str(item.get("category", "Other")).strip()
+    available = bool(item.get("available", True))
+    
+    return {
+        "id": str(item.get("id", "")),
+        "name": name,
+        "price": price,
+        "description": description,
+        "category": category,
+        "available": available,
+        "metadata": item.get("metadata", {})
+    }
 
 
-# ============================================================================
-# MENU FORMATTING VARIATIONS
-# ============================================================================
-
-def format_menu_compact(menu: Dict[str, Any]) -> str:
+def _normalize_price(price: Any) -> Optional[float]:
     """
-    Format menu in compact form (minimal tokens).
-    Useful when context window is tight.
+    Normalize price to float.
     
     Args:
-        menu: Menu dictionary from get_menu()
+        price: Raw price value
         
     Returns:
-        Compact menu string
+        Normalized price or None if invalid
+    """
+    try:
+        # Handle various price formats
+        if isinstance(price, (int, float)):
+            price_float = float(price)
+        elif isinstance(price, str):
+            # Remove currency symbols and commas
+            price_clean = price.replace("$", "").replace(",", "").strip()
+            price_float = float(price_clean)
+        else:
+            return None
+        
+        # Validate range
+        if price_float < 0 or price_float > 10000:
+            logger.warning(f"Price out of range: {price_float}")
+            return None
+        
+        # Round to 2 decimal places
+        return round(price_float, 2)
+    
+    except (ValueError, TypeError) as e:
+        logger.error(f"Price normalization error: {str(e)}")
+        return None
+
+
+def _get_fallback_menu(restaurant_id: str) -> Dict[str, Any]:
+    """
+    Get safe fallback menu.
+    
+    Args:
+        restaurant_id: Restaurant identifier
+        
+    Returns:
+        Minimal fallback menu
+    """
+    logger.warning(f"Using fallback menu for {restaurant_id}")
+    
+    return {
+        "items": [
+            {
+                "id": "fallback_1",
+                "name": "Special of the Day",
+                "price": 0.00,
+                "description": "Please ask for today's specials",
+                "category": "Specials",
+                "available": True,
+                "metadata": {"fallback": True}
+            }
+        ],
+        "categories": ["Specials"],
+        "restaurant_id": restaurant_id,
+        "fallback": True,
+        "validated_at": datetime.utcnow().isoformat()
+    }
+
+
+def format_menu_for_prompt(menu: Dict[str, Any], max_items: Optional[int] = None) -> str:
+    """
+    Format menu for LLM prompt.
+    
+    Args:
+        menu: Menu data
+        max_items: Maximum items to include (optional)
+        
+    Returns:
+        Formatted menu string
         
     Example:
-        >>> compact = format_menu_compact(menu)
+        >>> menu_text = format_menu_for_prompt(menu, max_items=10)
     """
-    if not menu.get("has_items", False):
-        return "Menu unavailable."
+    if not menu or not menu.get("items"):
+        return "Menu unavailable. Please ask customer what they'd like."
     
-    items = menu.get("items", [])
+    items = menu["items"]
     
-    lines = ["MENU:"]
-    for item in items:
-        name = item.get("name", "Unknown")
-        price = item.get("price", 0.0)
-        item_id = item.get("id", "?")
-        lines.append(f"{name} ${price:.2f} [{item_id}]")
+    # Limit items if requested
+    if max_items and len(items) > max_items:
+        items = items[:max_items]
     
-    return "\n".join(lines)
-
-
-def format_menu_by_category(menu: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Format menu as dictionary grouped by category.
-    Useful for programmatic access in AI logic.
-    
-    Args:
-        menu: Menu dictionary from get_menu()
-        
-    Returns:
-        Dictionary mapping category -> list of items
-        
-    Example:
-        >>> by_category = format_menu_by_category(menu)
-        >>> pizzas = by_category.get("Pizza", [])
-    """
-    if not menu.get("has_items", False):
-        return {}
-    
-    items = menu.get("items", [])
+    # Group by category
     categorized = {}
-    
     for item in items:
+        if not item.get("available", True):
+            continue
+        
         category = item.get("category", "Other")
         if category not in categorized:
             categorized[category] = []
         categorized[category].append(item)
     
-    return categorized
+    # Format output
+    lines = []
+    
+    for category, items_in_cat in sorted(categorized.items()):
+        lines.append(f"\n{category}:")
+        lines.append("-" * 40)
+        
+        for item in items_in_cat:
+            name = item["name"]
+            price = item["price"]
+            description = item.get("description", "")
+            
+            # Format item line
+            item_line = f"• {name} - ${price:.2f}"
+            
+            if description:
+                item_line += f"\n  {description}"
+            
+            lines.append(item_line)
+    
+    return "\n".join(lines)
 
 
-# ============================================================================
-# MENU SEARCH & FILTERING
-# ============================================================================
+def format_menu_compact(menu: Dict[str, Any]) -> str:
+    """
+    Format menu in compact format (names and prices only).
+    
+    Args:
+        menu: Menu data
+        
+    Returns:
+        Compact menu string
+    """
+    if not menu or not menu.get("items"):
+        return "Menu unavailable"
+    
+    items = [
+        f"{item['name']} (${item['price']:.2f})"
+        for item in menu["items"]
+        if item.get("available", True)
+    ]
+    
+    return ", ".join(items)
+
 
 def search_menu_items(
     menu: Dict[str, Any],
     query: str,
-    search_fields: Optional[List[str]] = None
+    category: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search menu items by name, description, or category.
+    Search menu items by name or description.
     
     Args:
-        menu: Menu dictionary from get_menu()
-        query: Search term
-        search_fields: Optional list of fields to search (default: name, description, category)
+        menu: Menu data
+        query: Search query
+        category: Filter by category (optional)
         
     Returns:
-        List of matching menu items
-        
-    Example:
-        >>> results = search_menu_items(menu, "pizza")
-        >>> print(f"Found {len(results)} items")
+        Matching items
     """
-    if not menu.get("has_items", False):
+    if not menu or not menu.get("items"):
         return []
     
-    # Default search fields
-    if search_fields is None:
-        search_fields = ["name", "description", "category"]
+    query_lower = query.lower()
+    results = []
     
-    items = menu.get("items", [])
-    query_lower = query.lower().strip()
-    matches = []
-    
-    for item in items:
-        # Check each search field
-        for field in search_fields:
-            value = item.get(field, "")
-            if isinstance(value, str) and query_lower in value.lower():
-                matches.append(item)
-                break  # Don't add duplicates
-    
-    return matches
-
-
-def filter_menu_by_category(
-    menu: Dict[str, Any],
-    category: str
-) -> List[Dict[str, Any]]:
-    """
-    Filter menu items by category.
-    
-    Args:
-        menu: Menu dictionary from get_menu()
-        category: Category name to filter by
-        
-    Returns:
-        List of items in the category
-        
-    Example:
-        >>> pizzas = filter_menu_by_category(menu, "Pizza")
-    """
-    if not menu.get("has_items", False):
-        return []
-    
-    items = menu.get("items", [])
-    return [
-        item for item in items
-        if item.get("category", "").lower() == category.lower()
-    ]
-
-
-def filter_menu_by_price_range(
-    menu: Dict[str, Any],
-    min_price: Optional[float] = None,
-    max_price: Optional[float] = None
-) -> List[Dict[str, Any]]:
-    """
-    Filter menu items by price range.
-    
-    Args:
-        menu: Menu dictionary from get_menu()
-        min_price: Minimum price (inclusive)
-        max_price: Maximum price (inclusive)
-        
-    Returns:
-        List of items within price range
-        
-    Example:
-        >>> affordable = filter_menu_by_price_range(menu, max_price=10.00)
-    """
-    if not menu.get("has_items", False):
-        return []
-    
-    items = menu.get("items", [])
-    filtered = []
-    
-    for item in items:
-        price = item.get("price", 0.0)
-        
-        # Check min price
-        if min_price is not None and price < min_price:
+    for item in menu["items"]:
+        if not item.get("available", True):
             continue
         
-        # Check max price
-        if max_price is not None and price > max_price:
+        # Category filter
+        if category and item.get("category") != category:
             continue
         
-        filtered.append(item)
+        # Search in name and description
+        name = item.get("name", "").lower()
+        description = item.get("description", "").lower()
+        
+        if query_lower in name or query_lower in description:
+            results.append(item)
     
-    return filtered
+    return results
 
 
-# ============================================================================
-# MENU ITEM LOOKUP
-# ============================================================================
-
-def get_menu_item_by_id(
-    menu: Dict[str, Any],
-    item_id: str
-) -> Optional[Dict[str, Any]]:
+def get_item_by_id(menu: Dict[str, Any], item_id: str) -> Optional[Dict[str, Any]]:
     """
-    Get a specific menu item by ID.
+    Get menu item by ID.
     
     Args:
-        menu: Menu dictionary from get_menu()
+        menu: Menu data
         item_id: Item identifier
         
     Returns:
-        Menu item dictionary or None if not found
-        
-    Example:
-        >>> item = get_menu_item_by_id(menu, "pizza_1")
-        >>> if item:
-        >>>     print(f"Found: {item['name']}")
+        Menu item or None
     """
-    if not menu.get("has_items", False):
+    if not menu or not menu.get("items"):
         return None
     
-    items = menu.get("items", [])
-    
-    for item in items:
+    for item in menu["items"]:
         if item.get("id") == item_id:
             return item
     
     return None
 
 
-def get_menu_item_by_name(
-    menu: Dict[str, Any],
-    name: str,
-    fuzzy: bool = False
-) -> Optional[Dict[str, Any]]:
+def get_item_by_name(menu: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
     """
-    Get a menu item by name.
+    Get menu item by name (case-insensitive).
     
     Args:
-        menu: Menu dictionary from get_menu()
-        name: Item name to search for
-        fuzzy: If True, use partial matching
+        menu: Menu data
+        name: Item name
         
     Returns:
-        Menu item dictionary or None if not found
-        
-    Example:
-        >>> item = get_menu_item_by_name(menu, "Margherita Pizza")
+        Menu item or None
     """
-    if not menu.get("has_items", False):
+    if not menu or not menu.get("items"):
         return None
     
-    items = menu.get("items", [])
-    name_lower = name.lower().strip()
+    name_lower = name.lower()
     
-    for item in items:
-        item_name = item.get("name", "").lower()
-        
-        if fuzzy:
-            # Partial match
-            if name_lower in item_name or item_name in name_lower:
-                return item
-        else:
-            # Exact match
-            if item_name == name_lower:
-                return item
+    for item in menu["items"]:
+        if item.get("name", "").lower() == name_lower:
+            return item
     
     return None
 
 
-# ============================================================================
-# MENU STATISTICS
-# ============================================================================
-
-def get_menu_stats(menu: Dict[str, Any]) -> Dict[str, Any]:
+def get_items_by_category(menu: Dict[str, Any], category: str) -> List[Dict[str, Any]]:
     """
-    Get statistics about the menu.
+    Get all items in a category.
     
     Args:
-        menu: Menu dictionary from get_menu()
+        menu: Menu data
+        category: Category name
         
     Returns:
-        Dictionary with menu statistics
-        
-    Example:
-        >>> stats = get_menu_stats(menu)
-        >>> print(f"Average price: ${stats['avg_price']:.2f}")
+        List of items
     """
-    if not menu.get("has_items", False):
-        return {
-            "total_items": 0,
-            "total_categories": 0,
-            "avg_price": 0.0,
-            "min_price": 0.0,
-            "max_price": 0.0,
-            "price_range": 0.0
-        }
+    if not menu or not menu.get("items"):
+        return []
     
-    items = menu.get("items", [])
-    prices = [item.get("price", 0.0) for item in items]
-    
-    return {
-        "total_items": len(items),
-        "total_categories": len(menu.get("categories", [])),
-        "avg_price": sum(prices) / len(prices) if prices else 0.0,
-        "min_price": min(prices) if prices else 0.0,
-        "max_price": max(prices) if prices else 0.0,
-        "price_range": max(prices) - min(prices) if prices else 0.0
-    }
+    return [
+        item for item in menu["items"]
+        if item.get("category") == category and item.get("available", True)
+    ]
 
 
-# ============================================================================
-# MENU VALIDATION
-# ============================================================================
-
-def validate_menu_items(menu: Dict[str, Any]) -> Dict[str, Any]:
+def get_categories(menu: Dict[str, Any]) -> List[str]:
     """
-    Validate menu items and return validation report.
+    Get list of categories.
     
     Args:
-        menu: Menu dictionary from get_menu()
+        menu: Menu data
         
     Returns:
-        Validation report with issues found
-        
-    Example:
-        >>> report = validate_menu_items(menu)
-        >>> if report["has_issues"]:
-        >>>     print(f"Issues: {report['issues']}")
+        List of category names
     """
-    issues = []
-    items = menu.get("items", [])
+    if not menu:
+        return []
     
-    for idx, item in enumerate(items):
-        # Check required fields
-        if not item.get("id"):
-            issues.append(f"Item {idx}: Missing ID")
-        
-        if not item.get("name"):
-            issues.append(f"Item {idx}: Missing name")
-        
-        price = item.get("price")
-        if price is None:
-            issues.append(f"Item {idx}: Missing price")
-        elif price < 0:
-            issues.append(f"Item {idx}: Negative price (${price})")
+    # Use explicit categories if available
+    if menu.get("categories"):
+        return menu["categories"]
     
+    # Otherwise extract from items
+    categories = set()
+    for item in menu.get("items", []):
+        cat = item.get("category")
+        if cat:
+            categories.add(cat)
+    
+    return sorted(list(categories))
+
+
+def invalidate_menu_cache(restaurant_id: str):
+    """
+    Invalidate cached menu.
+    
+    Args:
+        restaurant_id: Restaurant identifier
+    """
+    _menu_cache.invalidate(restaurant_id)
+
+
+def clear_menu_cache():
+    """Clear all cached menus."""
+    _menu_cache.clear()
+
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Get menu cache statistics."""
     return {
-        "has_issues": len(issues) > 0,
-        "issue_count": len(issues),
-        "issues": issues,
-        "valid_items": len(items) - len(issues)
+        "size": _menu_cache.size(),
+        "max_size": _menu_cache.max_size,
+        "ttl_seconds": _menu_cache.ttl
     }
 
-
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
 
 if __name__ == "__main__":
-    """
-    Example usage of the menu module.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
-    print("Menu Access Module Example")
-    print("=" * 50)
-    
-    # Mock restaurant ID
-    restaurant_id = "rest_123"
-    
-    try:
-        # Fetch menu
-        print(f"\nFetching menu for restaurant: {restaurant_id}")
-        menu = get_menu(restaurant_id)
+    async def example():
+        print("Menu Module (Production)")
+        print("=" * 50)
         
-        print(f"✓ Menu loaded")
-        print(f"  - Items: {menu['item_count']}")
-        print(f"  - Categories: {len(menu['categories'])}")
-        print(f"  - Has items: {menu['has_items']}")
+        # Create sample menu
+        sample_menu = {
+            "restaurant_id": "rest_001",
+            "items": [
+                {
+                    "id": "1",
+                    "name": "Large Pizza",
+                    "price": 15.99,
+                    "description": "Classic large pizza with your choice of toppings",
+                    "category": "Pizza",
+                    "available": True
+                },
+                {
+                    "id": "2",
+                    "name": "Chicken Wings",
+                    "price": "$9.99",  # Test price normalization
+                    "description": "Crispy chicken wings",
+                    "category": "Appetizers",
+                    "available": True
+                },
+                {
+                    "id": "3",
+                    "name": "Caesar Salad",
+                    "price": 8.50,
+                    "description": "Fresh romaine lettuce with caesar dressing",
+                    "category": "Salads",
+                    "available": False  # Unavailable
+                }
+            ],
+            "categories": ["Pizza", "Appetizers", "Salads"]
+        }
         
-        if menu['has_items']:
-            print(f"\nCategories: {', '.join(menu['categories'])}")
-            
-            # Format for AI
-            print("\n" + "=" * 50)
-            print("Formatted for AI Prompt:")
-            print("=" * 50)
-            formatted = format_menu_for_prompt(menu)
-            print(formatted)
-            
-            # Compact format
-            print("\n" + "=" * 50)
-            print("Compact Format:")
-            print("=" * 50)
-            compact = format_menu_compact(menu)
-            print(compact)
-            
-            # Statistics
-            print("\n" + "=" * 50)
-            print("Menu Statistics:")
-            print("=" * 50)
-            stats = get_menu_stats(menu)
-            for key, value in stats.items():
-                if isinstance(value, float):
-                    print(f"  {key}: ${value:.2f}" if "price" in key else f"  {key}: {value:.2f}")
-                else:
-                    print(f"  {key}: {value}")
-            
-            # Search example
-            print("\n" + "=" * 50)
-            print("Search Example:")
-            print("=" * 50)
-            results = search_menu_items(menu, "pizza")
-            print(f"Search 'pizza': {len(results)} results")
-            
-            # Get item by ID (example)
-            if menu['items']:
-                first_item_id = menu['items'][0].get('id')
-                item = get_menu_item_by_id(menu, first_item_id)
-                if item:
-                    print(f"\nItem lookup by ID '{first_item_id}':")
-                    print(f"  Name: {item.get('name')}")
-                    print(f"  Price: ${item.get('price', 0):.2f}")
-            
-            # Validation
-            print("\n" + "=" * 50)
-            print("Validation Report:")
-            print("=" * 50)
-            validation = validate_menu_items(menu)
-            if validation['has_issues']:
-                print(f"⚠ Found {validation['issue_count']} issues:")
-                for issue in validation['issues']:
-                    print(f"  - {issue}")
-            else:
-                print("✓ All items valid")
+        # Validate
+        validated = _validate_menu(sample_menu)
+        print(f"\nValidated menu: {len(validated['items'])} items")
         
-        else:
-            print("\n⚠ Menu is empty")
+        # Format for prompt
+        print("\nFormatted for LLM:")
+        print(format_menu_for_prompt(validated))
+        
+        # Compact format
+        print("\nCompact format:")
+        print(format_menu_compact(validated))
+        
+        # Search
+        print("\nSearch 'pizza':")
+        results = search_menu_items(validated, "pizza")
+        for item in results:
+            print(f"  - {item['name']} (${item['price']:.2f})")
+        
+        # Categories
+        print("\nCategories:", get_categories(validated))
+        
+        # Cache stats
+        print("\nCache stats:", get_cache_stats())
+        
+        print("\n" + "=" * 50)
+        print("Production menu module ready")
     
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
+    asyncio.run(example())
