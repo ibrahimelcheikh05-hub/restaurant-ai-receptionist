@@ -1,635 +1,548 @@
 """
-Translation Layer
-=================
-Translate text between user language and internal English reasoning language.
-Uses Google Cloud Translation API for high-quality translations.
+Translation Module (Production)
+================================
+Hardened async translation with Google Cloud Translate.
+Strict timeouts, failure-safe fallbacks, graceful degradation.
+Never blocks, never crashes a call.
 """
 
 import os
 import asyncio
-from typing import Optional, Dict, Any
+import logging
+from typing import Dict, Any, Optional
 from google.cloud import translate_v2 as translate
 from google.oauth2 import service_account
 from google.api_core import exceptions as google_exceptions
+import json
+from datetime import datetime, timedelta
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+logger = logging.getLogger(__name__)
 
-# Supported languages
+
 SUPPORTED_LANGUAGES = {
-    "en": "English",
-    "ar": "Arabic", 
-    "es": "Spanish"
+    "en": "en",
+    "ar": "ar",
+    "es": "es"
 }
 
-# Internal reasoning language (always English)
-INTERNAL_LANGUAGE = "en"
+# Timeouts
+TRANSLATION_TIMEOUT = 3.0  # seconds
+MAX_RETRIES = 2
+RETRY_DELAY = 0.5  # seconds
 
-# Translation cache for common phrases (optional optimization)
-_translation_cache: Dict[str, str] = {}
-ENABLE_CACHE = True
-MAX_CACHE_SIZE = 1000
+# Limits
+MAX_TEXT_LENGTH = 5000
+MAX_CONCURRENT_TRANSLATIONS = 20
+
+# Cache
+CACHE_ENABLED = True
+CACHE_SIZE = 500
+CACHE_TTL = 3600  # 1 hour
 
 
-# ============================================================================
-# CLIENT INITIALIZATION
-# ============================================================================
-
-def _get_credentials() -> Optional[service_account.Credentials]:
-    """
-    Get Google Cloud credentials from environment.
+class TranslationCache:
+    """Simple in-memory cache with TTL."""
     
-    Returns:
-        Service account credentials or None (uses default)
+    def __init__(self, max_size: int = CACHE_SIZE, ttl: int = CACHE_TTL):
+        self.cache: Dict[str, tuple[str, datetime]] = {}
+        self.max_size = max_size
+        self.ttl = ttl
+    
+    def get(self, key: str) -> Optional[str]:
+        """Get cached translation if valid."""
+        if key not in self.cache:
+            return None
         
-    Environment variables checked:
-    - GOOGLE_APPLICATION_CREDENTIALS (path to JSON key file)
-    - GOOGLE_CLOUD_CREDENTIALS_JSON (JSON string)
-    """
-    # Method 1: Path to credentials file
+        value, timestamp = self.cache[key]
+        
+        # Check TTL
+        if datetime.utcnow() - timestamp > timedelta(seconds=self.ttl):
+            del self.cache[key]
+            return None
+        
+        return value
+    
+    def set(self, key: str, value: str):
+        """Cache translation with TTL."""
+        # Evict oldest if cache full
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+        
+        self.cache[key] = (value, datetime.utcnow())
+    
+    def clear(self):
+        """Clear cache."""
+        self.cache.clear()
+    
+    def size(self) -> int:
+        """Get cache size."""
+        return len(self.cache)
+
+
+_cache = TranslationCache()
+_client: Optional[translate.Client] = None
+_translation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
+
+
+def _get_credentials():
+    """Get Google Cloud credentials."""
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         return service_account.Credentials.from_service_account_file(creds_path)
     
-    # Method 2: JSON string in environment
     creds_json = os.getenv("GOOGLE_CLOUD_CREDENTIALS_JSON")
     if creds_json:
-        import json
         creds_dict = json.loads(creds_json)
         return service_account.Credentials.from_service_account_info(creds_dict)
     
-    # Method 3: Use default credentials (for GCP environments)
     return None
 
 
 def _create_client() -> translate.Client:
-    """
-    Create Google Cloud Translation client.
-    
-    Returns:
-        Initialized Translation Client
-        
-    Raises:
-        RuntimeError: If credentials cannot be loaded
-    """
-    try:
-        credentials = _get_credentials()
-        if credentials:
-            return translate.Client(credentials=credentials)
-        else:
-            # Use application default credentials (works in GCP)
-            return translate.Client()
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to initialize Google Cloud Translation client: {str(e)}. "
-            f"Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON"
-        )
-
-
-# Global client instance (lazy-loaded)
-_client: Optional[translate.Client] = None
+    """Create Google Cloud Translate client."""
+    credentials = _get_credentials()
+    if credentials:
+        return translate.Client(credentials=credentials)
+    return translate.Client()
 
 
 def _get_client() -> translate.Client:
-    """Get or create the global Translation client."""
+    """Get or create Translate client."""
     global _client
     if _client is None:
         _client = _create_client()
     return _client
 
 
-# ============================================================================
-# CORE TRANSLATION FUNCTIONS
-# ============================================================================
-
-async def to_english(text: str, source_language: str) -> str:
-    """
-    Translate user input to English for internal reasoning.
-    
-    Args:
-        text: Text to translate
-        source_language: Source language code ('en', 'ar', 'es')
-        
-    Returns:
-        Translated text in English
-        
-    Raises:
-        ValueError: If text is empty or language unsupported
-        RuntimeError: If translation fails
-        
-    Example:
-        >>> english_text = await to_english("Hola, quiero pizza", "es")
-        >>> print(english_text)  # "Hello, I want pizza"
-    """
-    # Validate input
-    if not text or text.strip() == "":
-        raise ValueError("text cannot be empty")
-    
-    if source_language not in SUPPORTED_LANGUAGES:
-        raise ValueError(
-            f"Unsupported source language: {source_language}. "
-            f"Supported: {list(SUPPORTED_LANGUAGES.keys())}"
-        )
-    
-    # If already in English, return as-is
-    if source_language == INTERNAL_LANGUAGE:
-        return text
-    
-    # Check cache first
-    cache_key = f"{source_language}->en:{text}"
-    if ENABLE_CACHE and cache_key in _translation_cache:
-        return _translation_cache[cache_key]
-    
-    try:
-        # Perform translation
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: _get_client().translate(
-                text,
-                source_language=source_language,
-                target_language=INTERNAL_LANGUAGE,
-                format_="text"
-            )
-        )
-        
-        translated_text = result["translatedText"]
-        
-        # Cache the result
-        if ENABLE_CACHE and len(_translation_cache) < MAX_CACHE_SIZE:
-            _translation_cache[cache_key] = translated_text
-        
-        return translated_text
-        
-    except google_exceptions.BadRequest as e:
-        raise ValueError(f"Invalid translation request: {str(e)}")
-    except google_exceptions.GoogleAPIError as e:
-        raise RuntimeError(f"Google Cloud API error: {str(e)}")
-    except Exception as e:
-        raise RuntimeError(f"Translation to English failed: {str(e)}")
+def _get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
+    """Generate cache key."""
+    import hashlib
+    content = f"{source_lang}:{target_lang}:{text}"
+    return hashlib.md5(content.encode()).hexdigest()
 
 
-async def from_english(text: str, target_language: str) -> str:
-    """
-    Translate internal English response to user's language.
-    
-    Args:
-        text: Text in English to translate
-        target_language: Target language code ('en', 'ar', 'es')
-        
-    Returns:
-        Translated text in target language
-        
-    Raises:
-        ValueError: If text is empty or language unsupported
-        RuntimeError: If translation fails
-        
-    Example:
-        >>> spanish_text = await from_english("Hello, I want pizza", "es")
-        >>> print(spanish_text)  # "Hola, quiero pizza"
-    """
-    # Validate input
-    if not text or text.strip() == "":
-        raise ValueError("text cannot be empty")
-    
-    if target_language not in SUPPORTED_LANGUAGES:
-        raise ValueError(
-            f"Unsupported target language: {target_language}. "
-            f"Supported: {list(SUPPORTED_LANGUAGES.keys())}"
-        )
-    
-    # If target is English, return as-is
-    if target_language == INTERNAL_LANGUAGE:
-        return text
-    
-    # Check cache first
-    cache_key = f"en->{target_language}:{text}"
-    if ENABLE_CACHE and cache_key in _translation_cache:
-        return _translation_cache[cache_key]
-    
-    try:
-        # Perform translation
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: _get_client().translate(
-                text,
-                source_language=INTERNAL_LANGUAGE,
-                target_language=target_language,
-                format_="text"
-            )
-        )
-        
-        translated_text = result["translatedText"]
-        
-        # Cache the result
-        if ENABLE_CACHE and len(_translation_cache) < MAX_CACHE_SIZE:
-            _translation_cache[cache_key] = translated_text
-        
-        return translated_text
-        
-    except google_exceptions.BadRequest as e:
-        raise ValueError(f"Invalid translation request: {str(e)}")
-    except google_exceptions.GoogleAPIError as e:
-        raise RuntimeError(f"Google Cloud API error: {str(e)}")
-    except Exception as e:
-        raise RuntimeError(f"Translation from English failed: {str(e)}")
-
-
-# ============================================================================
-# BIDIRECTIONAL TRANSLATION
-# ============================================================================
-
-async def translate_bidirectional(
+async def to_english(
     text: str,
-    from_language: str,
-    to_language: str
+    source_language: str,
+    fallback_to_original: bool = True
 ) -> str:
     """
-    Translate between any two supported languages.
-    Goes through English if needed (pivot translation).
+    Translate text to English with timeout and fallback.
     
     Args:
         text: Text to translate
-        from_language: Source language code
-        to_language: Target language code
+        source_language: Source language code ('ar', 'es', etc.)
+        fallback_to_original: Return original text on error (default: True)
         
     Returns:
-        Translated text
+        Translated text (or original if translation fails)
         
     Example:
-        >>> result = await translate_bidirectional("Hola", "es", "ar")
+        >>> english = await to_english("Hola", "es")
+        >>> print(english)  # "Hello"
     """
-    # Validate input
-    if not text or text.strip() == "":
-        raise ValueError("text cannot be empty")
-    
-    if from_language not in SUPPORTED_LANGUAGES:
-        raise ValueError(f"Unsupported source language: {from_language}")
-    
-    if to_language not in SUPPORTED_LANGUAGES:
-        raise ValueError(f"Unsupported target language: {to_language}")
-    
-    # If same language, return as-is
-    if from_language == to_language:
+    # Skip if already English
+    if source_language == "en":
         return text
     
-    # If either is English, use direct translation
-    if from_language == INTERNAL_LANGUAGE:
-        return await from_english(text, to_language)
+    # Validate input
+    if not text or not isinstance(text, str):
+        return text if fallback_to_original else ""
     
-    if to_language == INTERNAL_LANGUAGE:
-        return await to_english(text, from_language)
+    text_clean = text.strip()
     
-    # Otherwise, pivot through English
-    english_text = await to_english(text, from_language)
-    final_text = await from_english(english_text, to_language)
+    if not text_clean:
+        return text if fallback_to_original else ""
     
-    return final_text
+    # Length check
+    if len(text_clean) > MAX_TEXT_LENGTH:
+        logger.warning(f"Text too long ({len(text_clean)} chars), truncating")
+        text_clean = text_clean[:MAX_TEXT_LENGTH]
+    
+    # Validate source language
+    if source_language not in SUPPORTED_LANGUAGES:
+        logger.warning(f"Unsupported source language: {source_language}")
+        return text if fallback_to_original else text_clean
+    
+    # Check cache
+    if CACHE_ENABLED:
+        cache_key = _get_cache_key(text_clean, source_language, "en")
+        cached = _cache.get(cache_key)
+        if cached:
+            logger.debug(f"Cache hit: {source_language}→en")
+            return cached
+    
+    # Translate with retry and timeout
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            async with _translation_semaphore:
+                result = await asyncio.wait_for(
+                    _translate_text(text_clean, source_language, "en"),
+                    timeout=TRANSLATION_TIMEOUT
+                )
+            
+            if result:
+                # Cache result
+                if CACHE_ENABLED:
+                    _cache.set(cache_key, result)
+                
+                logger.debug(
+                    f"Translated {source_language}→en: "
+                    f"{text_clean[:50]}... → {result[:50]}..."
+                )
+                return result
+            
+            # Empty result, use fallback
+            logger.warning(f"Empty translation result for: {text_clean[:50]}...")
+            return text if fallback_to_original else text_clean
+        
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Translation timeout (attempt {attempt + 1}/{MAX_RETRIES + 1})"
+            )
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            # Max retries reached
+            logger.error(f"Translation failed after {MAX_RETRIES + 1} attempts")
+            return text if fallback_to_original else text_clean
+        
+        except google_exceptions.GoogleAPICallError as e:
+            logger.error(f"Google API error (attempt {attempt + 1}): {str(e)}")
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            return text if fallback_to_original else text_clean
+        
+        except Exception as e:
+            logger.error(f"Translation error (attempt {attempt + 1}): {str(e)}")
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            return text if fallback_to_original else text_clean
+    
+    # Should never reach here, but safety fallback
+    return text if fallback_to_original else text_clean
 
 
-# ============================================================================
-# LANGUAGE DETECTION
-# ============================================================================
-
-async def detect_language(text: str) -> Dict[str, Any]:
+async def from_english(
+    text: str,
+    target_language: str,
+    fallback_to_original: bool = True
+) -> str:
     """
-    Detect the language of input text.
+    Translate text from English with timeout and fallback.
     
     Args:
-        text: Text to analyze
+        text: English text to translate
+        target_language: Target language code ('ar', 'es', etc.)
+        fallback_to_original: Return original text on error (default: True)
         
     Returns:
-        Dictionary with:
-        - language: Detected language code
-        - confidence: Confidence score (0.0 to 1.0)
-        - is_supported: Whether language is supported
+        Translated text (or original if translation fails)
         
     Example:
-        >>> result = await detect_language("Hola mundo")
-        >>> print(result["language"])  # "es"
+        >>> spanish = await from_english("Hello", "es")
+        >>> print(spanish)  # "Hola"
     """
-    if not text or text.strip() == "":
-        raise ValueError("text cannot be empty")
+    # Skip if target is English
+    if target_language == "en":
+        return text
+    
+    # Validate input
+    if not text or not isinstance(text, str):
+        return text if fallback_to_original else ""
+    
+    text_clean = text.strip()
+    
+    if not text_clean:
+        return text if fallback_to_original else ""
+    
+    # Length check
+    if len(text_clean) > MAX_TEXT_LENGTH:
+        logger.warning(f"Text too long ({len(text_clean)} chars), truncating")
+        text_clean = text_clean[:MAX_TEXT_LENGTH]
+    
+    # Validate target language
+    if target_language not in SUPPORTED_LANGUAGES:
+        logger.warning(f"Unsupported target language: {target_language}")
+        return text if fallback_to_original else text_clean
+    
+    # Check cache
+    if CACHE_ENABLED:
+        cache_key = _get_cache_key(text_clean, "en", target_language)
+        cached = _cache.get(cache_key)
+        if cached:
+            logger.debug(f"Cache hit: en→{target_language}")
+            return cached
+    
+    # Translate with retry and timeout
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            async with _translation_semaphore:
+                result = await asyncio.wait_for(
+                    _translate_text(text_clean, "en", target_language),
+                    timeout=TRANSLATION_TIMEOUT
+                )
+            
+            if result:
+                # Cache result
+                if CACHE_ENABLED:
+                    _cache.set(cache_key, result)
+                
+                logger.debug(
+                    f"Translated en→{target_language}: "
+                    f"{text_clean[:50]}... → {result[:50]}..."
+                )
+                return result
+            
+            # Empty result, use fallback
+            logger.warning(f"Empty translation result for: {text_clean[:50]}...")
+            return text if fallback_to_original else text_clean
+        
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Translation timeout (attempt {attempt + 1}/{MAX_RETRIES + 1})"
+            )
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            # Max retries reached
+            logger.error(f"Translation failed after {MAX_RETRIES + 1} attempts")
+            return text if fallback_to_original else text_clean
+        
+        except google_exceptions.GoogleAPICallError as e:
+            logger.error(f"Google API error (attempt {attempt + 1}): {str(e)}")
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            return text if fallback_to_original else text_clean
+        
+        except Exception as e:
+            logger.error(f"Translation error (attempt {attempt + 1}): {str(e)}")
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            
+            return text if fallback_to_original else text_clean
+    
+    # Should never reach here, but safety fallback
+    return text if fallback_to_original else text_clean
+
+
+async def _translate_text(
+    text: str,
+    source_lang: str,
+    target_lang: str
+) -> Optional[str]:
+    """
+    Internal translation function.
+    
+    Args:
+        text: Text to translate
+        source_lang: Source language code
+        target_lang: Target language code
+        
+    Returns:
+        Translated text or None
+    """
+    if not text:
+        return None
     
     try:
+        # Run blocking translate call in executor
         loop = asyncio.get_event_loop()
+        client = _get_client()
+        
         result = await loop.run_in_executor(
             None,
-            lambda: _get_client().detect_language(text)
+            lambda: client.translate(
+                text,
+                target_language=target_lang,
+                source_language=source_lang
+            )
         )
         
-        language_code = result["language"]
-        confidence = result["confidence"]
+        if result and "translatedText" in result:
+            return result["translatedText"]
         
-        return {
-            "language": language_code,
-            "confidence": confidence,
-            "is_supported": language_code in SUPPORTED_LANGUAGES
-        }
-        
+        return None
+    
     except Exception as e:
-        raise RuntimeError(f"Language detection failed: {str(e)}")
+        logger.error(f"Translation API error: {str(e)}")
+        return None
 
 
-# ============================================================================
-# BATCH TRANSLATION
-# ============================================================================
-
-async def translate_batch_to_english(
-    texts: list[str],
-    source_language: str
-) -> list[str]:
+def is_translation_needed(source_lang: str, target_lang: str) -> bool:
     """
-    Translate multiple texts to English in batch.
-    More efficient for multiple translations.
+    Check if translation is needed.
     
     Args:
-        texts: List of texts to translate
-        source_language: Source language code
+        source_lang: Source language
+        target_lang: Target language
         
     Returns:
-        List of translated texts
-        
-    Example:
-        >>> texts = ["Hola", "Adiós"]
-        >>> results = await translate_batch_to_english(texts, "es")
+        True if translation needed
     """
-    if not texts:
-        return []
-    
-    # If already English, return as-is
-    if source_language == INTERNAL_LANGUAGE:
-        return texts
-    
-    # Translate each (could be optimized with parallel execution)
-    translated = []
-    for text in texts:
-        result = await to_english(text, source_language)
-        translated.append(result)
-    
-    return translated
+    return source_lang != target_lang
 
-
-async def translate_batch_from_english(
-    texts: list[str],
-    target_language: str
-) -> list[str]:
-    """
-    Translate multiple texts from English in batch.
-    
-    Args:
-        texts: List of English texts to translate
-        target_language: Target language code
-        
-    Returns:
-        List of translated texts
-        
-    Example:
-        >>> texts = ["Hello", "Goodbye"]
-        >>> results = await translate_batch_from_english(texts, "es")
-    """
-    if not texts:
-        return []
-    
-    # If target is English, return as-is
-    if target_language == INTERNAL_LANGUAGE:
-        return texts
-    
-    # Translate each
-    translated = []
-    for text in texts:
-        result = await from_english(text, target_language)
-        translated.append(result)
-    
-    return translated
-
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
 
 def get_supported_languages() -> list[str]:
-    """
-    Get list of supported language codes.
-    
-    Returns:
-        List of language codes
-        
-    Example:
-        >>> langs = get_supported_languages()
-        >>> print(langs)  # ['en', 'ar', 'es']
-    """
+    """Get list of supported languages."""
     return list(SUPPORTED_LANGUAGES.keys())
 
 
-def get_language_name(language_code: str) -> str:
-    """
-    Get full language name from code.
-    
-    Args:
-        language_code: Language code
-        
-    Returns:
-        Language name
-        
-    Example:
-        >>> name = get_language_name("es")
-        >>> print(name)  # "Spanish"
-    """
-    return SUPPORTED_LANGUAGES.get(language_code, "Unknown")
-
-
 def is_language_supported(language_code: str) -> bool:
-    """
-    Check if a language is supported.
-    
-    Args:
-        language_code: Language code to check
-        
-    Returns:
-        True if supported
-        
-    Example:
-        >>> is_language_supported("es")  # True
-        >>> is_language_supported("fr")  # False
-    """
+    """Check if language is supported."""
     return language_code in SUPPORTED_LANGUAGES
 
 
-def clear_cache() -> int:
-    """
-    Clear the translation cache.
-    
-    Returns:
-        Number of entries cleared
-        
-    Example:
-        >>> cleared = clear_cache()
-        >>> print(f"Cleared {cleared} cached translations")
-    """
-    global _translation_cache
-    count = len(_translation_cache)
-    _translation_cache.clear()
-    return count
+def clear_cache():
+    """Clear translation cache."""
+    _cache.clear()
+    logger.info("Translation cache cleared")
+
+
+def get_cache_size() -> int:
+    """Get current cache size."""
+    return _cache.size()
 
 
 def get_cache_stats() -> Dict[str, Any]:
-    """
-    Get translation cache statistics.
-    
-    Returns:
-        Dictionary with cache stats
-        
-    Example:
-        >>> stats = get_cache_stats()
-        >>> print(f"Cache size: {stats['size']}")
-    """
+    """Get cache statistics."""
     return {
-        "enabled": ENABLE_CACHE,
-        "size": len(_translation_cache),
-        "max_size": MAX_CACHE_SIZE,
-        "utilization": len(_translation_cache) / MAX_CACHE_SIZE if MAX_CACHE_SIZE > 0 else 0
+        "size": _cache.size(),
+        "max_size": _cache.max_size,
+        "ttl_seconds": _cache.ttl
     }
 
 
-# ============================================================================
-# CONVERSATION FLOW HELPER
-# ============================================================================
-
-async def translate_conversation_turn(
-    user_text: str,
-    user_language: str,
-    ai_response: str
-) -> Dict[str, str]:
+async def batch_translate_to_english(
+    texts: list[str],
+    source_language: str,
+    fallback_to_original: bool = True
+) -> list[str]:
     """
-    Complete conversation turn translation workflow.
+    Translate multiple texts to English concurrently.
     
     Args:
-        user_text: User input in their language
-        user_language: User's language code
-        ai_response: AI response in English
+        texts: List of texts to translate
+        source_language: Source language
+        fallback_to_original: Return original on error
         
     Returns:
-        Dictionary with:
-        - user_input_english: User input translated to English
-        - ai_response_translated: AI response in user's language
-        
-    Example:
-        >>> result = await translate_conversation_turn(
-        >>>     "Hola, quiero pizza",
-        >>>     "es",
-        >>>     "Great! What size pizza would you like?"
-        >>> )
-        >>> print(result["user_input_english"])
-        >>> print(result["ai_response_translated"])
+        List of translated texts
     """
-    # Translate user input to English for AI processing
-    user_input_english = await to_english(user_text, user_language)
+    if not texts:
+        return []
     
-    # Translate AI response to user's language
-    ai_response_translated = await from_english(ai_response, user_language)
+    tasks = [
+        to_english(text, source_language, fallback_to_original)
+        for text in texts
+    ]
     
-    return {
-        "user_input_english": user_input_english,
-        "ai_response_translated": ai_response_translated
-    }
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Handle exceptions in results
+    final_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Batch translation error for text {i}: {str(result)}")
+            final_results.append(texts[i] if fallback_to_original else "")
+        else:
+            final_results.append(result)
+    
+    return final_results
 
 
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
+async def batch_translate_from_english(
+    texts: list[str],
+    target_language: str,
+    fallback_to_original: bool = True
+) -> list[str]:
+    """
+    Translate multiple texts from English concurrently.
+    
+    Args:
+        texts: List of English texts to translate
+        target_language: Target language
+        fallback_to_original: Return original on error
+        
+    Returns:
+        List of translated texts
+    """
+    if not texts:
+        return []
+    
+    tasks = [
+        from_english(text, target_language, fallback_to_original)
+        for text in texts
+    ]
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Handle exceptions in results
+    final_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Batch translation error for text {i}: {str(result)}")
+            final_results.append(texts[i] if fallback_to_original else "")
+        else:
+            final_results.append(result)
+    
+    return final_results
+
 
 if __name__ == "__main__":
-    """
-    Example usage of the translation layer.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
     async def example():
-        print("Translation Layer Example")
+        print("Translation Module (Production)")
         print("=" * 50)
         
-        # Supported languages
-        print("\nSupported Languages:")
-        for code, name in SUPPORTED_LANGUAGES.items():
-            print(f"  {code}: {name}")
+        print("\nSupported languages:", ", ".join(get_supported_languages()))
         
-        # Example translations
-        print("\n" + "=" * 50)
-        print("Example Translations")
-        print("=" * 50)
+        print("\nTest translations:")
+        print("-" * 50)
+        
+        # English to Spanish
+        spanish = await from_english("Hello, how are you?", "es")
+        print(f"EN→ES: Hello, how are you? → {spanish}")
         
         # Spanish to English
-        spanish_text = "Hola, quiero ordenar una pizza grande"
-        print(f"\nSpanish: {spanish_text}")
+        english = await to_english("Hola, ¿cómo estás?", "es")
+        print(f"ES→EN: Hola, ¿cómo estás? → {english}")
         
-        try:
-            english = await to_english(spanish_text, "es")
-            print(f"English: {english}")
-        except Exception as e:
-            print(f"Error: {e}")
+        # Arabic to English
+        english = await to_english("مرحبا، كيف حالك؟", "ar")
+        print(f"AR→EN: مرحبا، كيف حالك؟ → {english}")
         
-        # English to Arabic
-        english_text = "Your order total is $25.50"
-        print(f"\nEnglish: {english_text}")
-        
-        try:
-            arabic = await from_english(english_text, "ar")
-            print(f"Arabic: {arabic}")
-        except Exception as e:
-            print(f"Error: {e}")
-        
-        # Language detection
         print("\n" + "=" * 50)
-        print("Language Detection")
-        print("=" * 50)
+        print("Cache stats:", get_cache_stats())
         
-        test_texts = [
-            "Hello, how are you?",
-            "مرحبا، كيف حالك؟",
-            "Hola, ¿cómo estás?"
-        ]
+        print("\nBatch translation test:")
+        texts = ["Hello", "Goodbye", "Thank you"]
+        results = await batch_translate_from_english(texts, "es")
+        for eng, spa in zip(texts, results):
+            print(f"  {eng} → {spa}")
         
-        for text in test_texts:
-            try:
-                result = await detect_language(text)
-                lang_name = get_language_name(result["language"])
-                print(f"\nText: {text}")
-                print(f"Detected: {lang_name} ({result['language']})")
-                print(f"Confidence: {result['confidence']:.2%}")
-                print(f"Supported: {result['is_supported']}")
-            except Exception as e:
-                print(f"Error: {e}")
-        
-        # Cache stats
         print("\n" + "=" * 50)
-        print("Cache Statistics")
-        print("=" * 50)
-        stats = get_cache_stats()
-        print(f"Enabled: {stats['enabled']}")
-        print(f"Size: {stats['size']}/{stats['max_size']}")
-        print(f"Utilization: {stats['utilization']:.1%}")
-        
-        # Conversation flow example
-        print("\n" + "=" * 50)
-        print("Conversation Flow Example")
-        print("=" * 50)
-        
-        try:
-            conversation = await translate_conversation_turn(
-                user_text="Quiero dos pizzas grandes",
-                user_language="es",
-                ai_response="Great! Would you like any drinks with that?"
-            )
-            
-            print(f"\nUser (Spanish): Quiero dos pizzas grandes")
-            print(f"→ Translated to English: {conversation['user_input_english']}")
-            print(f"\nAI (English): Great! Would you like any drinks with that?")
-            print(f"→ Translated to Spanish: {conversation['ai_response_translated']}")
-        except Exception as e:
-            print(f"Error: {e}")
+        print("Production translation ready")
     
-    # Run example
     asyncio.run(example())
