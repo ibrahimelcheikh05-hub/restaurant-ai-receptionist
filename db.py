@@ -1,475 +1,591 @@
 """
-Supabase Data Layer
-===================
-All database interactions for the restaurant voice ordering system.
-Pure data gateway - no business logic.
+Database Module (Production)
+=============================
+Hardened async database layer with Supabase.
+Retry queues, fire-and-forget writes, circuit breakers, failure tolerance.
+Never blocks live calls.
 """
 
 import os
-from typing import Dict, List, Optional, Any
-from datetime import datetime
+import asyncio
+import logging
+from typing import Dict, List, Any, Optional
+from datetime import datetime, timedelta
+from collections import deque
+from enum import Enum
+import json
+
 from supabase import create_client, Client
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+from postgrest.exceptions import APIError
 
 
-class SupabaseDB:
+logger = logging.getLogger(__name__)
+
+
+# Configuration
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds
+CIRCUIT_BREAKER_THRESHOLD = 5
+CIRCUIT_BREAKER_TIMEOUT = 30  # seconds
+MAX_WRITE_QUEUE_SIZE = 1000
+BATCH_WRITE_SIZE = 10
+BATCH_WRITE_INTERVAL = 2.0  # seconds
+
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"    # Normal operation
+    OPEN = "open"        # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+class CircuitBreaker:
+    """Circuit breaker for database operations."""
+    
+    def __init__(
+        self,
+        threshold: int = CIRCUIT_BREAKER_THRESHOLD,
+        timeout: int = CIRCUIT_BREAKER_TIMEOUT
+    ):
+        self.threshold = threshold
+        self.timeout = timeout
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self.success_count = 0
+    
+    def record_success(self):
+        """Record successful operation."""
+        self.failure_count = 0
+        
+        if self.state == CircuitState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= 2:
+                self.state = CircuitState.CLOSED
+                self.success_count = 0
+                logger.info("Circuit breaker closed (recovered)")
+    
+    def record_failure(self):
+        """Record failed operation."""
+        self.failure_count += 1
+        self.last_failure_time = datetime.utcnow()
+        
+        if self.failure_count >= self.threshold:
+            self.state = CircuitState.OPEN
+            logger.error(
+                f"Circuit breaker opened "
+                f"(failures: {self.failure_count})"
+            )
+    
+    def can_execute(self) -> bool:
+        """Check if operation can execute."""
+        if self.state == CircuitState.CLOSED:
+            return True
+        
+        if self.state == CircuitState.OPEN:
+            # Check if timeout expired
+            if self.last_failure_time:
+                elapsed = (datetime.utcnow() - self.last_failure_time).total_seconds()
+                if elapsed >= self.timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    self.success_count = 0
+                    logger.info("Circuit breaker half-open (testing)")
+                    return True
+            return False
+        
+        # HALF_OPEN - allow one test request
+        return True
+    
+    def get_state(self) -> str:
+        """Get current state."""
+        return self.state.value
+
+
+class WriteQueue:
+    """Fire-and-forget write queue with batching."""
+    
+    def __init__(self, max_size: int = MAX_WRITE_QUEUE_SIZE):
+        self.queue: deque = deque(maxlen=max_size)
+        self.max_size = max_size
+        self.dropped_count = 0
+    
+    def enqueue(self, operation: Dict[str, Any]) -> bool:
+        """
+        Enqueue write operation.
+        
+        Args:
+            operation: Write operation data
+            
+        Returns:
+            True if enqueued, False if queue full
+        """
+        if len(self.queue) >= self.max_size:
+            self.dropped_count += 1
+            logger.warning(
+                f"Write queue full, dropping write "
+                f"(dropped: {self.dropped_count})"
+            )
+            return False
+        
+        self.queue.append(operation)
+        return True
+    
+    def dequeue_batch(self, size: int) -> List[Dict[str, Any]]:
+        """Dequeue batch of operations."""
+        batch = []
+        for _ in range(min(size, len(self.queue))):
+            if self.queue:
+                batch.append(self.queue.popleft())
+        return batch
+    
+    def size(self) -> int:
+        """Get queue size."""
+        return len(self.queue)
+    
+    def is_empty(self) -> bool:
+        """Check if queue is empty."""
+        return len(self.queue) == 0
+
+
+class DatabaseClient:
     """
-    Supabase database gateway for restaurant voice ordering system.
-    Handles all data persistence operations.
+    Production database client with resilience features.
+    Async-only, fire-and-forget writes, circuit breakers.
     """
     
     def __init__(self):
-        """Initialize Supabase client with credentials from environment."""
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_KEY")
+        self.client: Optional[Client] = None
+        self.write_queue = WriteQueue()
+        self.circuit_breaker = CircuitBreaker()
         
-        if not supabase_url or not supabase_key:
-            raise ValueError(
-                "Missing Supabase credentials. "
-                "Set SUPABASE_URL and SUPABASE_KEY environment variables."
-            )
+        # Background tasks
+        self.write_processor_task: Optional[asyncio.Task] = None
+        self.is_running = False
         
-        self.client: Client = create_client(supabase_url, supabase_key)
+        # Stats
+        self.read_count = 0
+        self.write_count = 0
+        self.error_count = 0
+        self.retry_count = 0
+        
+        # Initialize client
+        self._initialize_client()
+        
+        logger.info("DatabaseClient initialized")
     
-    # ========================================================================
-    # MENU OPERATIONS
-    # ========================================================================
-    
-    def fetch_menu(self, restaurant_id: str) -> List[Dict[str, Any]]:
-        """
-        Fetch menu items for a restaurant.
-        
-        Args:
-            restaurant_id: Unique identifier for the restaurant
-            
-        Returns:
-            List of menu item dictionaries
-            
-        Raises:
-            Exception: If database query fails
-        """
+    def _initialize_client(self):
+        """Initialize Supabase client."""
         try:
-            response = self.client.table("menu_items").select("*").eq(
-                "restaurant_id", restaurant_id
-            ).eq("active", True).execute()
+            url = os.getenv("SUPABASE_URL")
+            key = os.getenv("SUPABASE_KEY")
             
-            return response.data
-        except Exception as e:
-            raise Exception(f"Failed to fetch menu: {str(e)}")
-    
-    # ========================================================================
-    # ORDER OPERATIONS
-    # ========================================================================
-    
-    def store_order(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Store a new order in the database.
+            if not url or not key:
+                logger.error("SUPABASE_URL and SUPABASE_KEY required")
+                return
+            
+            self.client = create_client(url, key)
+            logger.info("Supabase client initialized")
         
-        Args:
-            order_data: Dictionary containing order information
-                Required fields:
-                - restaurant_id: str
-                - customer_phone: str
-                - items: List[Dict] (each with item_id, quantity, customizations)
-                - total_amount: float
-                - status: str (e.g., 'pending', 'confirmed')
-                Optional fields:
-                - customer_name: str
-                - delivery_address: str
-                - special_instructions: str
-                - call_log_id: str (reference to call that created this order)
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {str(e)}")
+    
+    async def start(self):
+        """Start background write processor."""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        self.write_processor_task = asyncio.create_task(
+            self._write_processor_loop()
+        )
+        logger.info("Database write processor started")
+    
+    async def stop(self):
+        """Stop background write processor."""
+        if not self.is_running:
+            return
+        
+        self.is_running = False
+        
+        if self.write_processor_task and not self.write_processor_task.done():
+            self.write_processor_task.cancel()
+            try:
+                await self.write_processor_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush remaining writes
+        await self._flush_writes()
+        
+        logger.info("Database write processor stopped")
+    
+    async def _write_processor_loop(self):
+        """Background loop to process write queue."""
+        try:
+            while self.is_running:
+                await asyncio.sleep(BATCH_WRITE_INTERVAL)
                 
-        Returns:
-            Created order record with generated ID
-            
-        Raises:
-            Exception: If database insert fails
-        """
-        try:
-            # Add timestamp
-            order_data["created_at"] = datetime.utcnow().isoformat()
-            
-            response = self.client.table("orders").insert(order_data).execute()
-            
-            return response.data[0] if response.data else {}
+                if self.write_queue.is_empty():
+                    continue
+                
+                await self._process_write_batch()
+        
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            raise Exception(f"Failed to store order: {str(e)}")
+            logger.error(f"Write processor error: {str(e)}")
+    
+    async def _process_write_batch(self):
+        """Process batch of writes."""
+        batch = self.write_queue.dequeue_batch(BATCH_WRITE_SIZE)
+        
+        if not batch:
+            return
+        
+        logger.debug(f"Processing write batch: {len(batch)} operations")
+        
+        for operation in batch:
+            try:
+                await self._execute_write(operation)
+            except Exception as e:
+                logger.error(f"Batch write error: {str(e)}")
+                # Continue with next operation (fire-and-forget)
+    
+    async def _execute_write(self, operation: Dict[str, Any]):
+        """Execute single write operation with retry."""
+        table = operation.get("table")
+        data = operation.get("data")
+        op_type = operation.get("type", "insert")
+        
+        if not self.client or not table or not data:
+            return
+        
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                loop = asyncio.get_event_loop()
+                
+                if op_type == "insert":
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.client.table(table).insert(data).execute()
+                    )
+                elif op_type == "upsert":
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.client.table(table).upsert(data).execute()
+                    )
+                
+                self.write_count += 1
+                self.circuit_breaker.record_success()
+                return
+            
+            except Exception as e:
+                logger.error(f"Write error (attempt {attempt + 1}): {str(e)}")
+                self.error_count += 1
+                
+                if attempt < MAX_RETRIES:
+                    self.retry_count += 1
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                else:
+                    self.circuit_breaker.record_failure()
+    
+    async def _flush_writes(self):
+        """Flush all pending writes."""
+        logger.info(f"Flushing {self.write_queue.size()} pending writes")
+        
+        while not self.write_queue.is_empty():
+            await self._process_write_batch()
+    
+    # ========================================================================
+    # READ OPERATIONS (Async with timeout and circuit breaker)
+    # ========================================================================
+    
+    async def fetch_menu(
+        self,
+        restaurant_id: str,
+        timeout: float = 5.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch menu (async, with timeout).
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            timeout: Operation timeout
+            
+        Returns:
+            Menu data or None on error
+        """
+        if not self.client:
+            logger.error("Database client not initialized")
+            return None
+        
+        if not self.circuit_breaker.can_execute():
+            logger.warning("Circuit breaker open, skipping read")
+            return None
+        
+        try:
+            loop = asyncio.get_event_loop()
+            
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.client
+                        .table("menus")
+                        .select("*")
+                        .eq("restaurant_id", restaurant_id)
+                        .execute()
+                ),
+                timeout=timeout
+            )
+            
+            self.read_count += 1
+            self.circuit_breaker.record_success()
+            
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            
+            return None
+        
+        except asyncio.TimeoutError:
+            logger.error(f"Menu fetch timeout for {restaurant_id}")
+            self.error_count += 1
+            self.circuit_breaker.record_failure()
+            return None
+        
+        except Exception as e:
+            logger.error(f"Menu fetch error: {str(e)}")
+            self.error_count += 1
+            self.circuit_breaker.record_failure()
+            return None
+    
+    # ========================================================================
+    # WRITE OPERATIONS (Fire-and-forget)
+    # ========================================================================
+    
+    def store_call_log(self, call_data: Dict[str, Any]) -> bool:
+        """
+        Store call log (fire-and-forget).
+        
+        Args:
+            call_data: Call log data
+            
+        Returns:
+            True if enqueued
+        """
+        operation = {
+            "type": "insert",
+            "table": "call_logs",
+            "data": {
+                **call_data,
+                "created_at": datetime.utcnow().isoformat()
+            }
+        }
+        
+        return self.write_queue.enqueue(operation)
+    
+    def store_order(self, order_data: Dict[str, Any]) -> bool:
+        """
+        Store order (fire-and-forget).
+        
+        Args:
+            order_data: Order data
+            
+        Returns:
+            True if enqueued
+        """
+        operation = {
+            "type": "insert",
+            "table": "orders",
+            "data": {
+                **order_data,
+                "created_at": datetime.utcnow().isoformat()
+            }
+        }
+        
+        return self.write_queue.enqueue(operation)
     
     def update_order_status(
-        self, 
-        order_id: str, 
-        status: str, 
-        updated_by: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self,
+        order_id: str,
+        status: str
+    ) -> bool:
         """
-        Update the status of an existing order.
+        Update order status (fire-and-forget).
         
         Args:
-            order_id: Unique identifier for the order
-            status: New status value
-            updated_by: Optional identifier of who updated the order
+            order_id: Order identifier
+            status: New status
             
         Returns:
-            Updated order record
-            
-        Raises:
-            Exception: If database update fails
+            True if enqueued
         """
-        try:
-            update_data = {
+        operation = {
+            "type": "upsert",
+            "table": "orders",
+            "data": {
+                "order_id": order_id,
                 "status": status,
                 "updated_at": datetime.utcnow().isoformat()
             }
-            
-            if updated_by:
-                update_data["updated_by"] = updated_by
-            
-            response = self.client.table("orders").update(
-                update_data
-            ).eq("id", order_id).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to update order status: {str(e)}")
+        }
+        
+        return self.write_queue.enqueue(operation)
     
-    # ========================================================================
-    # CALL LOG OPERATIONS
-    # ========================================================================
-    
-    def store_call_log(self, call_data: Dict[str, Any]) -> Dict[str, Any]:
+    def store_transcript(
+        self,
+        call_id: str,
+        transcript_data: Dict[str, Any]
+    ) -> bool:
         """
-        Store a call log record.
+        Store conversation transcript (fire-and-forget).
         
         Args:
-            call_data: Dictionary containing call information
-                Required fields:
-                - restaurant_id: str
-                - caller_phone: str
-                - call_sid: str (Twilio call identifier)
-                - direction: str ('inbound' or 'outbound')
-                Optional fields:
-                - duration: int (seconds)
-                - status: str (e.g., 'completed', 'no-answer', 'busy')
-                - transcript: str
-                - recording_url: str
-                - agent_id: str
-                
-        Returns:
-            Created call log record with generated ID
-            
-        Raises:
-            Exception: If database insert fails
-        """
-        try:
-            # Add timestamp
-            call_data["created_at"] = datetime.utcnow().isoformat()
-            
-            response = self.client.table("call_logs").insert(call_data).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to store call log: {str(e)}")
-    
-    def update_call_log(
-        self, 
-        call_log_id: str, 
-        updates: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Update an existing call log record.
-        
-        Args:
-            call_log_id: Unique identifier for the call log
-            updates: Dictionary of fields to update
+            call_id: Call identifier
+            transcript_data: Transcript data
             
         Returns:
-            Updated call log record
-            
-        Raises:
-            Exception: If database update fails
+            True if enqueued
         """
-        try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
-            
-            response = self.client.table("call_logs").update(
-                updates
-            ).eq("id", call_log_id).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to update call log: {str(e)}")
-    
-    # ========================================================================
-    # RECORDING OPERATIONS
-    # ========================================================================
-    
-    def store_recording_path(
-        self, 
-        call_log_id: str, 
-        recording_url: str,
-        duration: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Store recording URL/path for a call.
-        
-        Args:
-            call_log_id: ID of the call log to update
-            recording_url: URL or path to the recording
-            duration: Optional recording duration in seconds
-            
-        Returns:
-            Updated call log record
-            
-        Raises:
-            Exception: If database update fails
-        """
-        try:
-            update_data = {
-                "recording_url": recording_url,
-                "updated_at": datetime.utcnow().isoformat()
+        operation = {
+            "type": "insert",
+            "table": "transcripts",
+            "data": {
+                "call_id": call_id,
+                **transcript_data,
+                "created_at": datetime.utcnow().isoformat()
             }
-            
-            if duration is not None:
-                update_data["duration"] = duration
-            
-            response = self.client.table("call_logs").update(
-                update_data
-            ).eq("id", call_log_id).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to store recording path: {str(e)}")
-    
-    # ========================================================================
-    # RESTAURANT SETTINGS OPERATIONS
-    # ========================================================================
-    
-    def fetch_restaurant_settings(
-        self, 
-        restaurant_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Fetch settings/configuration for a restaurant.
+        }
         
-        Args:
-            restaurant_id: Unique identifier for the restaurant
-            
-        Returns:
-            Restaurant settings dictionary or None if not found
-            Settings may include:
-            - name: str
-            - phone: str
-            - address: str
-            - business_hours: Dict
-            - delivery_enabled: bool
-            - pickup_enabled: bool
-            - tax_rate: float
-            - ai_agent_config: Dict
-            - payment_methods: List[str]
-            
-        Raises:
-            Exception: If database query fails
-        """
-        try:
-            response = self.client.table("restaurants").select("*").eq(
-                "id", restaurant_id
-            ).execute()
-            
-            return response.data[0] if response.data else None
-        except Exception as e:
-            raise Exception(f"Failed to fetch restaurant settings: {str(e)}")
-    
-    def update_restaurant_settings(
-        self,
-        restaurant_id: str,
-        settings: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Update restaurant settings.
-        
-        Args:
-            restaurant_id: Unique identifier for the restaurant
-            settings: Dictionary of settings to update
-            
-        Returns:
-            Updated restaurant record
-            
-        Raises:
-            Exception: If database update fails
-        """
-        try:
-            settings["updated_at"] = datetime.utcnow().isoformat()
-            
-            response = self.client.table("restaurants").update(
-                settings
-            ).eq("id", restaurant_id).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to update restaurant settings: {str(e)}")
+        return self.write_queue.enqueue(operation)
     
     # ========================================================================
-    # CUSTOMER OPERATIONS (BONUS)
+    # STATS & MONITORING
     # ========================================================================
     
-    def fetch_customer_by_phone(
-        self, 
-        phone: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Fetch customer record by phone number.
-        
-        Args:
-            phone: Customer phone number
-            
-        Returns:
-            Customer record or None if not found
-            
-        Raises:
-            Exception: If database query fails
-        """
-        try:
-            response = self.client.table("customers").select("*").eq(
-                "phone", phone
-            ).execute()
-            
-            return response.data[0] if response.data else None
-        except Exception as e:
-            raise Exception(f"Failed to fetch customer: {str(e)}")
+    def get_stats(self) -> Dict[str, Any]:
+        """Get database statistics."""
+        return {
+            "reads": self.read_count,
+            "writes": self.write_count,
+            "errors": self.error_count,
+            "retries": self.retry_count,
+            "queue_size": self.write_queue.size(),
+            "queue_dropped": self.write_queue.dropped_count,
+            "circuit_breaker": self.circuit_breaker.get_state(),
+            "circuit_failures": self.circuit_breaker.failure_count
+        }
     
-    def store_customer(self, customer_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Store or update customer information.
-        
-        Args:
-            customer_data: Dictionary containing customer information
-                Fields: phone, name, email, address, preferences, etc.
-                
-        Returns:
-            Customer record (created or updated)
-            
-        Raises:
-            Exception: If database operation fails
-        """
-        try:
-            customer_data["updated_at"] = datetime.utcnow().isoformat()
-            
-            # Upsert: insert or update if phone exists
-            response = self.client.table("customers").upsert(
-                customer_data,
-                on_conflict="phone"
-            ).execute()
-            
-            return response.data[0] if response.data else {}
-        except Exception as e:
-            raise Exception(f"Failed to store customer: {str(e)}")
+    def get_queue_size(self) -> int:
+        """Get write queue size."""
+        return self.write_queue.size()
     
-    # ========================================================================
-    # ANALYTICS & REPORTING (BONUS)
-    # ========================================================================
-    
-    def fetch_orders_by_date_range(
-        self,
-        restaurant_id: str,
-        start_date: str,
-        end_date: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch orders within a date range for analytics.
-        
-        Args:
-            restaurant_id: Unique identifier for the restaurant
-            start_date: ISO format date string
-            end_date: ISO format date string
-            
-        Returns:
-            List of order records
-            
-        Raises:
-            Exception: If database query fails
-        """
-        try:
-            response = self.client.table("orders").select("*").eq(
-                "restaurant_id", restaurant_id
-            ).gte("created_at", start_date).lte(
-                "created_at", end_date
-            ).execute()
-            
-            return response.data
-        except Exception as e:
-            raise Exception(f"Failed to fetch orders by date range: {str(e)}")
+    def is_healthy(self) -> bool:
+        """Check if database is healthy."""
+        return (
+            self.client is not None and
+            self.circuit_breaker.state != CircuitState.OPEN
+        )
 
 
 # ============================================================================
-# SINGLETON INSTANCE
+# GLOBAL DATABASE INSTANCE
 # ============================================================================
 
-# Create a singleton instance for easy importing
-db = SupabaseDB()
+db = DatabaseClient()
 
 
 # ============================================================================
-# USAGE EXAMPLES
+# AUTO-START WRITE PROCESSOR
 # ============================================================================
+
+async def _auto_start():
+    """Auto-start write processor."""
+    await db.start()
+
+
+# Initialize on import (non-blocking)
+try:
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        asyncio.create_task(_auto_start())
+    else:
+        loop.run_until_complete(_auto_start())
+except RuntimeError:
+    # No event loop, will start on first use
+    pass
+
+
+# ============================================================================
+# GRACEFUL SHUTDOWN
+# ============================================================================
+
+async def shutdown_db():
+    """Graceful database shutdown."""
+    await db.stop()
+    logger.info("Database shutdown complete")
+
+
+# ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+def is_db_healthy() -> bool:
+    """Check database health."""
+    return db.is_healthy()
+
+
+def get_db_stats() -> Dict[str, Any]:
+    """Get database statistics."""
+    return db.get_stats()
+
 
 if __name__ == "__main__":
-    """
-    Example usage of the SupabaseDB class.
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
-    # Initialize
-    database = SupabaseDB()
+    async def example():
+        print("Database Module (Production)")
+        print("=" * 50)
+        
+        # Start processor
+        await db.start()
+        print("\nWrite processor started")
+        
+        # Fire-and-forget writes
+        print("\nEnqueuing writes...")
+        db.store_call_log({
+            "restaurant_id": "rest_001",
+            "call_sid": "call_123",
+            "status": "completed"
+        })
+        
+        db.store_order({
+            "order_id": "ord_123",
+            "restaurant_id": "rest_001",
+            "total": 25.99
+        })
+        
+        print(f"Queue size: {db.get_queue_size()}")
+        
+        # Stats
+        print("\nDatabase stats:")
+        stats = get_db_stats()
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+        
+        # Health check
+        print(f"\nHealthy: {is_db_healthy()}")
+        
+        # Wait for writes to process
+        await asyncio.sleep(3)
+        
+        # Shutdown
+        await shutdown_db()
+        print("\nDatabase shutdown complete")
+        
+        print("\n" + "=" * 50)
+        print("Production database module ready")
     
-    # Fetch menu
-    try:
-        menu = database.fetch_menu(restaurant_id="rest_123")
-        print(f"Menu items: {len(menu)}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Store order
-    order = {
-        "restaurant_id": "rest_123",
-        "customer_phone": "+1234567890",
-        "customer_name": "John Doe",
-        "items": [
-            {
-                "item_id": "item_1",
-                "quantity": 2,
-                "customizations": ["no onions"]
-            }
-        ],
-        "total_amount": 25.50,
-        "status": "pending"
-    }
-    
-    try:
-        created_order = database.store_order(order)
-        print(f"Order created: {created_order.get('id')}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Store call log
-    call_log = {
-        "restaurant_id": "rest_123",
-        "caller_phone": "+1234567890",
-        "call_sid": "CA1234567890",
-        "direction": "inbound",
-        "status": "in-progress"
-    }
-    
-    try:
-        created_log = database.store_call_log(call_log)
-        print(f"Call log created: {created_log.get('id')}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Fetch restaurant settings
-    try:
-        settings = database.fetch_restaurant_settings("rest_123")
-        print(f"Restaurant: {settings.get('name') if settings else 'Not found'}")
-    except Exception as e:
-        print(f"Error: {e}")
+    asyncio.run(example())
