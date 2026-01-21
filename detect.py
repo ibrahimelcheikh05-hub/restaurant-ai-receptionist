@@ -1,73 +1,95 @@
 """
-Language Detection Module
-==========================
-Fast, accurate language detection for user input.
-Pure function, no external state, no translation.
+Language Detection Module (Production)
+=======================================
+Fast, deterministic language detection with call-level locking.
+Only processes final transcripts, never re-detects once locked.
 """
 
 from typing import Dict, Any, Optional, List
 from langdetect import detect_langs, LangDetectException
+import logging
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+logger = logging.getLogger(__name__)
+
 
 SUPPORTED_LANGUAGES = ["en", "ar", "es"]
 DEFAULT_LANGUAGE = "en"
-CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.7
+MIN_TEXT_LENGTH = 5
 
 
-# ============================================================================
-# CORE DETECTION FUNCTION
-# ============================================================================
+_call_language_lock: Dict[str, str] = {}
 
-def detect_language(text: str) -> Dict[str, Any]:
+
+def detect_language(
+    text: str,
+    call_id: Optional[str] = None,
+    is_final: bool = True
+) -> Dict[str, Any]:
     """
-    Detect the language of input text.
+    Detect language from text with call-level locking.
     
     Args:
         text: Input text to analyze
+        call_id: Call identifier for locking (optional)
+        is_final: Whether this is a final transcript (default: True)
         
     Returns:
         Dictionary with:
         - language: Detected language code ('en', 'ar', 'es')
         - confidence: Confidence score (0.0 to 1.0)
+        - locked: Whether language is locked for this call
         
     Example:
-        >>> result = detect_language("I want a pizza")
+        >>> result = detect_language("I want a pizza", "call_123", is_final=True)
         >>> print(result)
-        {'language': 'en', 'confidence': 0.95}
-        
-        >>> result = detect_language("Quiero una pizza")
-        >>> print(result)
-        {'language': 'es', 'confidence': 0.92}
-        
-        >>> result = detect_language("أريد بيتزا")
-        >>> print(result)
-        {'language': 'ar', 'confidence': 0.98}
+        {'language': 'en', 'confidence': 0.95, 'locked': True}
     """
+    # Return locked language if exists
+    if call_id and call_id in _call_language_lock:
+        locked_lang = _call_language_lock[call_id]
+        logger.debug(f"Language locked for {call_id}: {locked_lang}")
+        return {
+            "language": locked_lang,
+            "confidence": 1.0,
+            "locked": True
+        }
+    
+    # Only detect on final transcripts
+    if not is_final:
+        logger.debug("Skipping detection on partial transcript")
+        return {
+            "language": DEFAULT_LANGUAGE,
+            "confidence": 0.0,
+            "locked": False
+        }
+    
     # Validate input
     if not text or not isinstance(text, str):
         return {
             "language": DEFAULT_LANGUAGE,
-            "confidence": 0.0
+            "confidence": 0.0,
+            "locked": False
         }
     
-    # Clean and normalize text
+    # Clean text
     text_clean = text.strip()
     
     if len(text_clean) == 0:
         return {
             "language": DEFAULT_LANGUAGE,
-            "confidence": 0.0
+            "confidence": 0.0,
+            "locked": False
         }
     
-    # Need minimum text for reliable detection
-    if len(text_clean) < 3:
+    # Minimum length check
+    if len(text_clean) < MIN_TEXT_LENGTH:
+        logger.debug(f"Text too short for detection: {len(text_clean)} chars")
         return {
             "language": DEFAULT_LANGUAGE,
-            "confidence": 0.3
+            "confidence": 0.3,
+            "locked": False
         }
     
     try:
@@ -77,7 +99,8 @@ def detect_language(text: str) -> Dict[str, Any]:
         if not results:
             return {
                 "language": DEFAULT_LANGUAGE,
-                "confidence": 0.0
+                "confidence": 0.0,
+                "locked": False
             }
         
         # Get top result
@@ -89,36 +112,147 @@ def detect_language(text: str) -> Dict[str, Any]:
         if detected_code in SUPPORTED_LANGUAGES:
             final_language = detected_code
         else:
-            # Unsupported language detected, default to English
+            # Unsupported language, use default
             final_language = DEFAULT_LANGUAGE
             confidence = max(0.0, confidence - 0.3)
         
         # Apply confidence threshold
-        if confidence < CONFIDENCE_THRESHOLD and final_language != DEFAULT_LANGUAGE:
+        if confidence < CONFIDENCE_THRESHOLD:
+            logger.debug(
+                f"Low confidence ({confidence:.2f}), using default language"
+            )
             final_language = DEFAULT_LANGUAGE
+        
+        # Lock language for call if confidence is high enough
+        locked = False
+        if call_id and confidence >= CONFIDENCE_THRESHOLD:
+            _call_language_lock[call_id] = final_language
+            locked = True
+            logger.info(
+                f"Language locked for {call_id}: {final_language} "
+                f"(confidence: {confidence:.2f})"
+            )
         
         return {
             "language": final_language,
-            "confidence": round(confidence, 2)
+            "confidence": round(confidence, 2),
+            "locked": locked
         }
         
-    except LangDetectException:
-        # Detection failed (too short, etc.)
+    except LangDetectException as e:
+        logger.debug(f"LangDetect exception: {str(e)}")
         return {
             "language": DEFAULT_LANGUAGE,
-            "confidence": 0.0
+            "confidence": 0.0,
+            "locked": False
         }
-    except Exception:
-        # Unexpected error - fail gracefully
+    except Exception as e:
+        logger.error(f"Unexpected error in language detection: {str(e)}")
         return {
             "language": DEFAULT_LANGUAGE,
-            "confidence": 0.0
+            "confidence": 0.0,
+            "locked": False
         }
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
+def get_locked_language(call_id: str) -> Optional[str]:
+    """
+    Get locked language for a call.
+    
+    Args:
+        call_id: Call identifier
+        
+    Returns:
+        Locked language code or None
+        
+    Example:
+        >>> lang = get_locked_language("call_123")
+        >>> print(lang)  # "en" or None
+    """
+    return _call_language_lock.get(call_id)
+
+
+def is_language_locked(call_id: str) -> bool:
+    """
+    Check if language is locked for a call.
+    
+    Args:
+        call_id: Call identifier
+        
+    Returns:
+        True if locked, False otherwise
+        
+    Example:
+        >>> if is_language_locked("call_123"):
+        >>>     print("Language is locked")
+    """
+    return call_id in _call_language_lock
+
+
+def unlock_language(call_id: str):
+    """
+    Unlock language for a call (call cleanup).
+    
+    Args:
+        call_id: Call identifier
+        
+    Example:
+        >>> unlock_language("call_123")
+    """
+    if call_id in _call_language_lock:
+        lang = _call_language_lock.pop(call_id)
+        logger.info(f"Language unlocked for {call_id}: {lang}")
+
+
+def lock_language(call_id: str, language_code: str) -> bool:
+    """
+    Manually lock language for a call.
+    
+    Args:
+        call_id: Call identifier
+        language_code: Language code to lock
+        
+    Returns:
+        True if locked successfully, False if invalid language
+        
+    Example:
+        >>> lock_language("call_123", "es")
+        True
+    """
+    if language_code not in SUPPORTED_LANGUAGES:
+        logger.warning(f"Cannot lock unsupported language: {language_code}")
+        return False
+    
+    _call_language_lock[call_id] = language_code
+    logger.info(f"Language manually locked for {call_id}: {language_code}")
+    return True
+
+
+def clear_all_locks():
+    """
+    Clear all language locks (for testing/cleanup).
+    
+    Example:
+        >>> clear_all_locks()
+    """
+    count = len(_call_language_lock)
+    _call_language_lock.clear()
+    logger.info(f"Cleared {count} language locks")
+
+
+def get_locked_calls() -> List[str]:
+    """
+    Get list of calls with locked languages.
+    
+    Returns:
+        List of call IDs
+        
+    Example:
+        >>> calls = get_locked_calls()
+        >>> print(calls)  # ["call_123", "call_456"]
+    """
+    return list(_call_language_lock.keys())
+
 
 def is_language_supported(language_code: str) -> bool:
     """
@@ -131,10 +265,8 @@ def is_language_supported(language_code: str) -> bool:
         True if supported
         
     Example:
-        >>> is_language_supported("en")
-        True
-        >>> is_language_supported("fr")
-        False
+        >>> is_language_supported("en")  # True
+        >>> is_language_supported("fr")  # False
     """
     return language_code in SUPPORTED_LANGUAGES
 
@@ -148,56 +280,9 @@ def get_supported_languages() -> List[str]:
         
     Example:
         >>> langs = get_supported_languages()
-        >>> print(langs)
-        ['en', 'ar', 'es']
+        >>> print(langs)  # ['en', 'ar', 'es']
     """
     return SUPPORTED_LANGUAGES.copy()
-
-
-def detect_with_fallback(
-    text: str,
-    fallback_language: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Detect language with custom fallback.
-    
-    Args:
-        text: Text to analyze
-        fallback_language: Language to use if confidence is low (default: 'en')
-        
-    Returns:
-        Detection result with applied fallback
-        
-    Example:
-        >>> result = detect_with_fallback("hmm...", fallback_language="es")
-    """
-    result = detect_language(text)
-    
-    # Apply fallback if confidence is too low
-    if result["confidence"] < CONFIDENCE_THRESHOLD:
-        result["language"] = fallback_language or DEFAULT_LANGUAGE
-        result["fallback_applied"] = True
-    else:
-        result["fallback_applied"] = False
-    
-    return result
-
-
-def batch_detect(texts: List[str]) -> List[Dict[str, Any]]:
-    """
-    Detect language for multiple texts.
-    
-    Args:
-        texts: List of texts to analyze
-        
-    Returns:
-        List of detection results
-        
-    Example:
-        >>> texts = ["Hello", "Hola", "مرحبا"]
-        >>> results = batch_detect(texts)
-    """
-    return [detect_language(text) for text in texts]
 
 
 def get_confidence_level(confidence: float) -> str:
@@ -212,8 +297,7 @@ def get_confidence_level(confidence: float) -> str:
         
     Example:
         >>> level = get_confidence_level(0.95)
-        >>> print(level)
-        'high'
+        >>> print(level)  # "high"
     """
     if confidence >= 0.8:
         return "high"
@@ -225,61 +309,46 @@ def get_confidence_level(confidence: float) -> str:
         return "very_low"
 
 
-# ============================================================================
-# USAGE EXAMPLE
-# ============================================================================
-
 if __name__ == "__main__":
-    """
-    Example usage of the language detection module.
-    """
-    import logging
-    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    print("Language Detection Module Example")
+    print("Language Detection Module (Production)")
     print("=" * 50)
     
     # Test cases
     test_cases = [
-        "I want to order a large pizza please",
-        "Quiero ordenar una pizza grande por favor",
-        "أريد طلب بيتزا كبيرة من فضلك",
-        "Hello, how are you?",
-        "Hola, ¿cómo estás?",
-        "مرحبا، كيف حالك؟",
-        "Can I get two burgers?",
-        "¿Puedo obtener dos hamburguesas?",
-        "هل يمكنني الحصول على اثنين من البرغر؟",
-        "pizza",  # Ambiguous
-        "123 456",  # Numbers only
-        ""  # Empty
+        ("I want to order a large pizza please", "call_001", True),
+        ("Quiero ordenar una pizza grande por favor", "call_002", True),
+        ("أريد طلب بيتزا كبيرة من فضلك", "call_003", True),
+        ("Hello", "call_004", True),
+        ("This is partial", "call_001", False),  # Partial, should skip
+        ("Another phrase", "call_001", True),  # Locked, should return EN
     ]
     
-    print("\nDetection Results:")
+    print("\nDetection Tests:")
     print("-" * 50)
     
-    for i, text in enumerate(test_cases, 1):
-        result = detect_language(text)
+    for text, call_id, is_final in test_cases:
+        result = detect_language(text, call_id, is_final)
         level = get_confidence_level(result["confidence"])
         
-        print(f"\n{i}. Text: {text if text else '(empty)'}")
-        print(f"   Language: {result['language']}")
-        print(f"   Confidence: {result['confidence']:.2f} ({level})")
+        print(f"\nText: {text}")
+        print(f"Call: {call_id}, Final: {is_final}")
+        print(f"Result: {result['language']} (confidence: {result['confidence']:.2f}, {level})")
+        print(f"Locked: {result['locked']}")
     
-    # Batch detection
     print("\n" + "=" * 50)
-    print("Batch Detection")
-    print("=" * 50)
-    
-    batch_texts = ["Hello", "Hola", "مرحبا"]
-    batch_results = batch_detect(batch_texts)
-    
-    for text, result in zip(batch_texts, batch_results):
-        print(f"{text}: {result['language']} ({result['confidence']:.2f})")
+    print("Locked Languages:")
+    for call_id in get_locked_calls():
+        lang = get_locked_language(call_id)
+        print(f"  {call_id}: {lang}")
     
     print("\n" + "=" * 50)
     print("Supported Languages:", ", ".join(get_supported_languages()))
+    
+    # Cleanup
+    clear_all_locks()
+    print("\nAll locks cleared")
