@@ -1,8 +1,8 @@
 """
-WebSocket Audio Gateway
-=======================
-Real-time audio streaming server using Twilio and Vocode.
-Handles audio I/O, STT/TTS coordination, and barge-in detection.
+WebSocket Audio Gateway (Production)
+=====================================
+Real-time audio streaming gateway for voice calls.
+Handles audio I/O, barge-in, call lifecycle, and fault tolerance.
 
 NO BUSINESS LOGIC - Pure audio orchestration only.
 """
@@ -10,164 +10,280 @@ NO BUSINESS LOGIC - Pure audio orchestration only.
 import os
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+import signal
+from typing import Dict, Optional, Any
 from datetime import datetime
-import base64
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
-import uvicorn
-
-from vocode.streaming.models.telephony import TwilioConfig
-from vocode.streaming.telephony.server.base import TelephonyServer
-from vocode.streaming.models.agent import ChatGPTAgentConfig
-from vocode.streaming.models.message import BaseMessage
-from vocode.streaming.models.synthesizer import AzureSynthesizerConfig
-from vocode.streaming.models.transcriber import (
-    DeepgramTranscriberConfig,
-    PunctuationConfig
-)
-
-# Import our modules (business logic lives here)
-from stt import transcribe_audio
-from tts import stream_tts, CancellationToken
-from detect import detect_language
-from main import handle_call_start, handle_user_text, handle_call_end
+from contextlib import asynccontextmanager
 
 
-# ============================================================================
-# LOGGING CONFIGURATION
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# ENVIRONMENT CONFIGURATION
-# ============================================================================
-
-# Twilio Configuration
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-
-# Server Configuration
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8000"))
-BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
-
-# Restaurant Configuration (default)
-DEFAULT_RESTAURANT_ID = os.getenv("DEFAULT_RESTAURANT_ID", "rest_001")
-
-# Audio Configuration
-AUDIO_ENCODING = "linear16"
-SAMPLE_RATE = 16000  # Hz
-CHUNK_SIZE = 4096  # Bytes
+MAX_AUDIO_BUFFER_SIZE = 1024 * 1024  # 1MB
+MAX_AUDIO_CHUNK_SIZE = 64 * 1024  # 64KB
+HEARTBEAT_INTERVAL = 10  # seconds
+HEARTBEAT_TIMEOUT = 30  # seconds
+SILENCE_THRESHOLD = 500  # ms before processing audio
 
 
-# ============================================================================
-# CALL STATE MANAGEMENT
-# ============================================================================
+_shutdown_event = asyncio.Event()
 
-class CallSession:
-    """
-    Manages state for a single active call.
-    Tracks audio streaming, barge-in, and TTS state.
-    """
+
+class CancellationToken:
+    """Token for cancelling operations."""
     
-    def __init__(self, call_id: str, restaurant_id: str):
+    def __init__(self):
+        self._cancelled = False
+        self._event = asyncio.Event()
+    
+    async def cancel(self):
+        """Cancel the operation."""
+        self._cancelled = True
+        self._event.set()
+    
+    def is_cancelled(self) -> bool:
+        """Check if cancelled."""
+        return self._cancelled
+    
+    async def wait_cancelled(self, timeout: float = 0.01) -> bool:
+        """Wait for cancellation with timeout."""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+
+class CallConnection:
+    """Manages a single call connection with full lifecycle control."""
+    
+    def __init__(self, call_id: str, websocket: WebSocket):
         self.call_id = call_id
-        self.restaurant_id = restaurant_id
+        self.websocket = websocket
+        self.restaurant_id: Optional[str] = None
         self.customer_phone: Optional[str] = None
         self.detected_language: Optional[str] = None
         
-        # Audio streaming state
-        self.is_speaking = False  # TTS is playing
-        self.is_listening = False  # Listening for user input
-        self.tts_token: Optional[CancellationToken] = None
-        
-        # Transfer state
+        # State flags
+        self.is_active = True
+        self.is_speaking = False
+        self.is_listening = False
         self.transfer_requested = False
         self.transfer_in_progress = False
         
-        # Timing
+        # Cancellation tokens
+        self.tts_token: Optional[CancellationToken] = None
+        self.stt_active = False
+        
+        # Audio buffering
+        self.audio_buffer = bytearray()
+        self.audio_buffer_lock = asyncio.Lock()
+        self.last_audio_time: Optional[datetime] = None
+        
+        # Heartbeat
+        self.last_heartbeat = datetime.utcnow()
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        
+        # Cleanup tracking
         self.start_time = datetime.utcnow()
         self.last_activity = datetime.utcnow()
         
-        # Barge-in detection
-        self.barge_in_detected = False
-        self.audio_buffer = bytearray()
-        
-        logger.info(f"CallSession created: {call_id}")
+        logger.info(f"CallConnection created: {call_id}")
     
-    async def start_tts(self) -> CancellationToken:
-        """Start TTS playback with cancellation support."""
-        # Don't start TTS if transfer is requested
+    async def start_heartbeat(self):
+        """Start heartbeat monitoring."""
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+    
+    async def _heartbeat_loop(self):
+        """Monitor connection health."""
+        try:
+            while self.is_active:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                
+                elapsed = (datetime.utcnow() - self.last_heartbeat).total_seconds()
+                
+                if elapsed > HEARTBEAT_TIMEOUT:
+                    logger.warning(f"Heartbeat timeout for call {self.call_id}")
+                    await self.close("heartbeat_timeout")
+                    break
+                
+                try:
+                    await self.websocket.send_json({"event": "ping"})
+                except Exception as e:
+                    logger.error(f"Heartbeat send failed for {self.call_id}: {str(e)}")
+                    await self.close("heartbeat_failed")
+                    break
+                    
+        except asyncio.CancelledError:
+            pass
+    
+    def update_heartbeat(self):
+        """Update last heartbeat timestamp."""
+        self.last_heartbeat = datetime.utcnow()
+        self.last_activity = datetime.utcnow()
+    
+    async def start_tts(self) -> Optional[CancellationToken]:
+        """Start TTS with cancellation support."""
         if self.transfer_requested or self.transfer_in_progress:
             logger.warning(f"TTS blocked - transfer active: {self.call_id}")
             return None
         
+        await self.stop_tts()
+        
         self.is_speaking = True
         self.is_listening = False
         self.tts_token = CancellationToken()
-        self.barge_in_detected = False
+        
+        logger.debug(f"TTS started for {self.call_id}")
         return self.tts_token
     
     async def stop_tts(self):
-        """Stop TTS playback (barge-in)."""
+        """Immediately stop TTS (barge-in)."""
         if self.tts_token and self.is_speaking:
             await self.tts_token.cancel()
-            self.barge_in_detected = True
-            logger.info(f"Barge-in detected for call {self.call_id}")
+            logger.info(f"Barge-in: TTS cancelled for {self.call_id}")
         
         self.is_speaking = False
-        self.is_listening = True
-    
-    def mark_transfer_requested(self):
-        """Mark that transfer has been requested."""
-        self.transfer_requested = True
-        self.is_listening = False
-        logger.info(f"Transfer requested for call {self.call_id}")
+        self.tts_token = None
     
     def start_listening(self):
         """Switch to listening mode."""
-        # Don't listen if transfer is active
         if self.transfer_requested or self.transfer_in_progress:
             return
         
         self.is_speaking = False
         self.is_listening = True
-        self.audio_buffer.clear()
+        logger.debug(f"Listening mode for {self.call_id}")
     
-    def add_audio_chunk(self, chunk: bytes):
-        """Buffer audio chunk for STT."""
-        self.audio_buffer.extend(chunk)
-        self.last_activity = datetime.utcnow()
+    async def add_audio_chunk(self, chunk: bytes) -> bool:
+        """
+        Add audio chunk to buffer with backpressure protection.
+        
+        Returns:
+            True if added, False if dropped (buffer full)
+        """
+        if not chunk:
+            return True
+        
+        if len(chunk) > MAX_AUDIO_CHUNK_SIZE:
+            logger.warning(f"Oversized audio chunk rejected: {len(chunk)} bytes")
+            return False
+        
+        async with self.audio_buffer_lock:
+            if len(self.audio_buffer) + len(chunk) > MAX_AUDIO_BUFFER_SIZE:
+                logger.warning(
+                    f"Audio buffer full for {self.call_id}, "
+                    f"dropping {len(chunk)} bytes"
+                )
+                return False
+            
+            self.audio_buffer.extend(chunk)
+            self.last_audio_time = datetime.utcnow()
+            self.last_activity = datetime.utcnow()
+            
+            return True
     
-    def get_and_clear_audio(self) -> bytes:
+    async def get_and_clear_audio(self) -> bytes:
         """Get buffered audio and clear buffer."""
-        audio = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        return audio
+        async with self.audio_buffer_lock:
+            audio = bytes(self.audio_buffer)
+            self.audio_buffer.clear()
+            return audio
     
-    def update_activity(self):
-        """Update last activity timestamp."""
-        self.last_activity = datetime.utcnow()
+    def mark_transfer_requested(self):
+        """Mark that transfer has been requested."""
+        self.transfer_requested = True
+        self.is_listening = False
+        logger.info(f"Transfer requested for {self.call_id}")
+    
+    async def close(self, reason: str = "normal"):
+        """Close connection and cleanup resources."""
+        if not self.is_active:
+            return
+        
+        logger.info(f"Closing call {self.call_id}, reason: {reason}")
+        
+        self.is_active = False
+        
+        # Cancel TTS
+        await self.stop_tts()
+        
+        # Cancel heartbeat
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop STT if active
+        if self.stt_active:
+            try:
+                from stt_streaming import stop_stream
+                await stop_stream(self.call_id)
+                self.stt_active = False
+            except Exception as e:
+                logger.error(f"Error stopping STT: {str(e)}")
+        
+        # Notify main.py of call end
+        try:
+            from main import handle_call_end
+            await handle_call_end(self.call_id)
+        except Exception as e:
+            logger.error(f"Error in call end handler: {str(e)}")
+        
+        logger.info(f"Call {self.call_id} closed")
 
 
-# Active call sessions
-active_calls: Dict[str, CallSession] = {}
+_active_connections: Dict[str, CallConnection] = {}
+_cleanup_task: Optional[asyncio.Task] = None
 
 
-# ============================================================================
-# FASTAPI APPLICATION
-# ============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    logger.info("WebSocket server starting")
+    
+    # Setup signal handlers
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, initiating shutdown")
+        _shutdown_event.set()
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Start cleanup task
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(_cleanup_loop())
+    
+    yield
+    
+    # Shutdown
+    logger.info("WebSocket server shutting down")
+    _shutdown_event.set()
+    
+    # Close all active connections
+    tasks = []
+    for conn in list(_active_connections.values()):
+        tasks.append(conn.close("server_shutdown"))
+    
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Cancel cleanup task
+    if _cleanup_task and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    
+    logger.info("Shutdown complete")
 
-app = FastAPI(title="Voice Agent WebSocket Server")
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -175,586 +291,468 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "active_calls": len(active_calls),
+        "active_calls": len(_active_connections),
         "timestamp": datetime.utcnow().isoformat()
     }
 
 
-# ============================================================================
-# TWILIO WEBHOOK HANDLERS
-# ============================================================================
-
 @app.post("/inbound_call")
-async def inbound_call(
-    CallSid: str,
-    From: str,
-    To: str
-):
-    """
-    Handle inbound Twilio call.
-    Returns TwiML to connect call to WebSocket.
-    """
-    logger.info(f"Inbound call: {CallSid} from {From}")
-    
-    # Return TwiML to connect to our WebSocket
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+async def handle_inbound_call(request: Request):
+    """Handle inbound call from Twilio."""
+    try:
+        form_data = await request.form()
+        call_sid = form_data.get("CallSid")
+        
+        if not call_sid:
+            return Response(
+                content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>",
+                media_type="application/xml"
+            )
+        
+        from config import get_config
+        config = get_config()
+        base_url = config.server.base_url
+        
+        ws_url = f"{base_url}/ws/{call_sid}".replace("http://", "ws://").replace("https://", "wss://")
+        
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{BASE_URL}/ws/{CallSid}" />
+        <Stream url="{ws_url}"/>
     </Connect>
 </Response>"""
-    
-    return Response(content=twiml, media_type="application/xml")
+        
+        logger.info(f"Inbound call: {call_sid}, WebSocket: {ws_url}")
+        
+        return Response(content=twiml, media_type="application/xml")
+        
+    except Exception as e:
+        logger.error(f"Error handling inbound call: {str(e)}", exc_info=True)
+        return Response(
+            content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>",
+            media_type="application/xml"
+        )
 
 
 @app.post("/call_status")
-async def call_status(
-    CallSid: str,
-    CallStatus: str
-):
+async def handle_call_status(request: Request):
     """Handle call status updates from Twilio."""
-    logger.info(f"Call status update: {CallSid} - {CallStatus}")
-    
-    # Handle call completion
-    if CallStatus in ["completed", "failed", "busy", "no-answer"]:
-        if CallSid in active_calls:
-            await _cleanup_call(CallSid)
-    
-    return {"status": "ok"}
+    try:
+        form_data = await request.form()
+        call_sid = form_data.get("CallSid")
+        call_status = form_data.get("CallStatus")
+        
+        logger.info(f"Call status: {call_sid} -> {call_status}")
+        
+        if call_status in ["completed", "failed", "busy", "no-answer"]:
+            conn = _active_connections.get(call_sid)
+            if conn:
+                await conn.close(f"call_status_{call_status}")
+                _active_connections.pop(call_sid, None)
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.error(f"Error handling call status: {str(e)}")
+        return {"status": "error", "error": str(e)}
 
-
-# ============================================================================
-# WEBSOCKET AUDIO STREAM HANDLER
-# ============================================================================
 
 @app.websocket("/ws/{call_sid}")
 async def websocket_endpoint(websocket: WebSocket, call_sid: str):
-    """
-    Main WebSocket handler for audio streaming.
-    Coordinates STT, TTS, and barge-in detection.
-    """
+    """WebSocket endpoint for audio streaming."""
     await websocket.accept()
-    logger.info(f"WebSocket connected: {call_sid}")
     
-    session: Optional[CallSession] = None
+    conn = CallConnection(call_sid, websocket)
+    _active_connections[call_sid] = conn
     
     try:
-        # Initialize call session
-        session = await _initialize_call_session(call_sid, websocket)
+        await conn.start_heartbeat()
         
-        # Main audio streaming loop
-        await _audio_stream_loop(websocket, session)
+        # Start call
+        await _handle_call_start(conn)
+        
+        # Main message loop
+        async for message in websocket.iter_json():
+            if _shutdown_event.is_set():
+                break
+            
+            if not conn.is_active:
+                break
+            
+            await _process_message(conn, message)
         
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {call_sid}")
-    
     except Exception as e:
         logger.error(f"WebSocket error for {call_sid}: {str(e)}", exc_info=True)
-    
     finally:
-        # Cleanup
-        await _cleanup_call(call_sid)
+        await conn.close("websocket_closed")
+        _active_connections.pop(call_sid, None)
 
 
-async def _initialize_call_session(
-    call_sid: str,
-    websocket: WebSocket
-) -> CallSession:
-    """
-    Initialize call session and start conversation.
-    
-    Args:
-        call_sid: Twilio call SID
-        websocket: WebSocket connection
-        
-    Returns:
-        Initialized CallSession
-    """
-    # Create session
-    session = CallSession(
-        call_id=call_sid,
-        restaurant_id=DEFAULT_RESTAURANT_ID
-    )
-    active_calls[call_sid] = session
-    
-    # Initialize call in main.py (business logic)
+async def _handle_call_start(conn: CallConnection):
+    """Handle call start event."""
     try:
-        await handle_call_start(
-            call_id=call_sid,
-            restaurant_id=session.restaurant_id,
-            customer_phone=session.customer_phone
-        )
-        logger.info(f"Call initialized: {call_sid}")
+        # Extract restaurant ID (from Twilio custom params if available)
+        conn.restaurant_id = os.getenv("DEFAULT_RESTAURANT_ID", "rest_001")
         
-        # Send initial greeting
-        await _send_greeting(websocket, session)
+        # Start STT stream
+        from stt_streaming import start_stream
+        await start_stream(conn.call_id, None)
+        conn.stt_active = True
         
-    except Exception as e:
-        logger.error(f"Failed to initialize call {call_sid}: {str(e)}")
-        raise
-    
-    return session
-
-
-async def _send_greeting(websocket: WebSocket, session: CallSession):
-    """Send initial greeting to caller."""
-    greeting = "Hello! Thank you for calling. How can I help you today?"
-    
-    # Detect language (default to English for greeting)
-    language = session.detected_language or "en"
-    
-    try:
-        # Start TTS
-        token = await session.start_tts()
-        
-        # Stream greeting
-        success = await stream_tts(
-            text=greeting,
-            language_code=language,
-            websocket=websocket,
-            cancellation_token=token
+        # Notify main.py
+        from main import handle_call_start
+        response = await handle_call_start(
+            call_id=conn.call_id,
+            restaurant_id=conn.restaurant_id
         )
         
-        if success:
-            session.start_listening()
-        else:
-            logger.warning(f"Greeting interrupted for {session.call_id}")
+        # Play greeting
+        greeting = response.get("greeting", "")
+        greeting_lang = response.get("language", "en")
+        
+        if greeting:
+            token = await conn.start_tts()
+            if token:
+                from tts_streaming import stream_tts
+                await stream_tts(
+                    text=greeting,
+                    language_code=greeting_lang,
+                    websocket=conn.websocket,
+                    call_id=conn.call_id,
+                    cancel_event=token
+                )
+            
+            conn.start_listening()
         
     except Exception as e:
-        logger.error(f"Failed to send greeting: {str(e)}")
-        session.start_listening()
+        logger.error(f"Error in call start: {str(e)}", exc_info=True)
 
 
-async def _audio_stream_loop(websocket: WebSocket, session: CallSession):
-    """
-    Main audio streaming loop.
-    Handles incoming audio, STT, and coordinates responses.
-    """
-    silence_threshold = 0.5  # Seconds of silence to trigger STT
-    last_audio_time = datetime.utcnow()
-    
-    session.start_listening()
-    
-    while True:
-        try:
-            # Receive message from Twilio
-            message = await websocket.receive_json()
-            
-            # Handle different message types
-            event = message.get("event")
-            
-            if event == "connected":
-                logger.info(f"Stream connected: {session.call_id}")
-                continue
-            
-            elif event == "start":
-                logger.info(f"Stream started: {session.call_id}")
-                # Extract customer phone if available
-                start_data = message.get("start", {})
-                custom_params = start_data.get("customParameters", {})
-                session.customer_phone = custom_params.get("from")
-                continue
-            
-            elif event == "media":
-                # Audio data received
-                media = message.get("media", {})
-                payload = media.get("payload")
-                
-                if not payload:
-                    continue
-                
-                # Decode audio
-                audio_chunk = base64.b64decode(payload)
-                
-                # Check for barge-in
-                if session.is_speaking:
-                    # User is speaking while TTS is playing - barge-in!
-                    await session.stop_tts()
-                
-                # Buffer audio if listening
-                if session.is_listening:
-                    session.add_audio_chunk(audio_chunk)
-                    last_audio_time = datetime.utcnow()
-                
-                # Check for silence (end of utterance)
-                silence_duration = (datetime.utcnow() - last_audio_time).total_seconds()
-                
-                if silence_duration >= silence_threshold and len(session.audio_buffer) > 0:
-                    # Process buffered audio
-                    await _process_user_audio(websocket, session)
-            
-            elif event == "stop":
-                logger.info(f"Stream stopped: {session.call_id}")
-                break
-            
-            else:
-                logger.debug(f"Unknown event: {event}")
-        
-        except WebSocketDisconnect:
-            break
-        
-        except Exception as e:
-            logger.error(f"Error in audio loop: {str(e)}", exc_info=True)
-            # Continue processing
-
-
-async def _process_user_audio(websocket: WebSocket, session: CallSession):
-    """
-    Process buffered user audio through STT and AI pipeline.
-    
-    Args:
-        websocket: WebSocket connection
-        session: Call session
-    """
-    # Don't process if transfer is requested
-    if session.transfer_requested or session.transfer_in_progress:
-        logger.info(f"Audio processing blocked - transfer active: {session.call_id}")
-        return
-    
+async def _process_message(conn: CallConnection, message: Dict[str, Any]):
+    """Process WebSocket message."""
     try:
-        # Get buffered audio
-        audio_bytes = session.get_and_clear_audio()
+        event = message.get("event")
         
-        if len(audio_bytes) < 1000:  # Too short, ignore
+        if not event:
             return
         
-        logger.info(f"Processing audio chunk: {len(audio_bytes)} bytes")
+        conn.update_heartbeat()
         
-        # Step 1: Speech-to-Text
-        stt_result = await transcribe_audio(
-            audio_bytes=audio_bytes,
-            language_hint=session.detected_language
-        )
+        if event == "start":
+            await _handle_start_event(conn, message)
         
-        text = stt_result.get("text", "").strip()
+        elif event == "media":
+            await _handle_media_event(conn, message)
+        
+        elif event == "stop":
+            await conn.close("stream_stopped")
+        
+        elif event == "pong":
+            pass
+        
+        else:
+            logger.debug(f"Unknown event: {event}")
+    
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+
+
+async def _handle_start_event(conn: CallConnection, message: Dict[str, Any]):
+    """Handle stream start event."""
+    try:
+        start_data = message.get("start", {})
+        custom_params = start_data.get("customParameters", {})
+        
+        if "From" in start_data:
+            conn.customer_phone = start_data["From"]
+        
+        logger.info(f"Stream started for {conn.call_id}")
+        
+    except Exception as e:
+        logger.error(f"Error in start event: {str(e)}")
+
+
+async def _handle_media_event(conn: CallConnection, message: Dict[str, Any]):
+    """Handle incoming audio media."""
+    try:
+        if conn.transfer_requested or conn.transfer_in_progress:
+            return
+        
+        media = message.get("media", {})
+        payload = media.get("payload")
+        
+        if not payload:
+            return
+        
+        # Decode audio
+        import base64
+        try:
+            audio_chunk = base64.b64decode(payload)
+        except Exception as e:
+            logger.warning(f"Failed to decode audio: {str(e)}")
+            return
+        
+        # Barge-in detection
+        if conn.is_speaking:
+            await conn.stop_tts()
+        
+        # Buffer audio
+        added = await conn.add_audio_chunk(audio_chunk)
+        
+        if not added:
+            return
+        
+        # Check for silence
+        if conn.last_audio_time:
+            silence_ms = (datetime.utcnow() - conn.last_audio_time).total_seconds() * 1000
+            
+            if silence_ms >= SILENCE_THRESHOLD and conn.is_listening:
+                await _process_buffered_audio(conn)
+        
+        # Feed to STT stream
+        if conn.stt_active:
+            from stt_streaming import feed_audio, get_transcript
+            await feed_audio(conn.call_id, audio_chunk)
+            
+            # Check for transcript
+            transcript = await get_transcript(conn.call_id)
+            
+            if transcript and transcript.get("is_final"):
+                await _handle_transcript(conn, transcript)
+        
+    except Exception as e:
+        logger.error(f"Error in media event: {str(e)}", exc_info=True)
+
+
+async def _process_buffered_audio(conn: CallConnection):
+    """Process buffered audio through STT."""
+    try:
+        audio_bytes = await conn.get_and_clear_audio()
+        
+        if len(audio_bytes) < 1000:
+            return
+        
+        # Legacy batch processing (fallback)
+        from stt_streaming import transcribe_audio
+        result = await transcribe_audio(audio_bytes, conn.detected_language)
+        
+        text = result.get("text", "").strip()
+        
+        if text:
+            await _handle_user_input(conn, text, result.get("language_code"))
+        
+    except Exception as e:
+        logger.error(f"Error processing audio buffer: {str(e)}")
+
+
+async def _handle_transcript(conn: CallConnection, transcript: Dict[str, Any]):
+    """Handle final transcript from streaming STT."""
+    try:
+        text = transcript.get("text", "").strip()
+        language = transcript.get("language_code")
         
         if not text:
-            logger.debug("No text transcribed")
             return
         
-        logger.info(f"Transcribed: {text}")
+        logger.info(f"Transcript for {conn.call_id}: {text}")
         
-        # Update detected language
-        detected_lang = stt_result.get("language_code")
-        if detected_lang and not session.detected_language:
-            session.detected_language = detected_lang
+        if not conn.detected_language and language:
+            conn.detected_language = language
         
-        # Step 2: Process through main AI pipeline
+        await _handle_user_input(conn, text, language)
+        
+    except Exception as e:
+        logger.error(f"Error handling transcript: {str(e)}")
+
+
+async def _handle_user_input(conn: CallConnection, text: str, language: Optional[str]):
+    """Handle user text input."""
+    try:
+        from main import handle_user_text
+        
         response = await handle_user_text(
             text=text,
-            call_id=session.call_id,
-            detected_language=detected_lang
+            call_id=conn.call_id,
+            detected_language=language
         )
         
-        # Step 2.5: Check for transfer request
+        # Check for transfer
         if response.get("actions", {}).get("transfer_requested"):
-            logger.info(f"Transfer requested via AI pipeline: {session.call_id}")
-            
-            transfer_details = response["actions"].get("transfer_details", {})
-            
-            # Execute transfer
-            await execute_call_transfer(
-                call_id=session.call_id,
-                websocket=websocket,
-                transfer_number=transfer_details.get("transfer_number"),
-                reason=transfer_details.get("reason", "Customer request")
-            )
+            await _execute_transfer(conn, response["actions"].get("transfer_details", {}))
             return
         
+        # Get AI response
         response_text = response.get("response_text", "")
-        response_language = response.get("language", "en")
+        response_lang = response.get("language", "en")
         
         if not response_text:
-            logger.warning("No response from AI")
             return
         
-        logger.info(f"AI Response: {response_text}")
-        
-        # Step 3: Text-to-Speech and stream back
-        token = await session.start_tts()
+        # Speak response
+        token = await conn.start_tts()
         
         if not token:
-            # TTS blocked (transfer active)
             return
         
+        from tts_streaming import stream_tts
         success = await stream_tts(
             text=response_text,
-            language_code=response_language,
-            websocket=websocket,
-            cancellation_token=token
+            language_code=response_lang,
+            websocket=conn.websocket,
+            call_id=conn.call_id,
+            cancel_event=token
         )
         
         if success:
-            # TTS completed without interruption
-            session.start_listening()
-        else:
-            # TTS was interrupted (barge-in)
-            logger.info(f"TTS interrupted by barge-in: {session.call_id}")
-            session.start_listening()
+            conn.start_listening()
         
     except Exception as e:
-        logger.error(f"Error processing user audio: {str(e)}", exc_info=True)
-        # Continue listening
-        session.start_listening()
+        logger.error(f"Error handling user input: {str(e)}", exc_info=True)
 
 
-async def execute_call_transfer(
-    call_id: str,
-    websocket: WebSocket,
-    transfer_number: str,
-    reason: str = "Customer requested transfer"
-):
-    """
-    Execute call transfer to human agent.
-    
-    This function:
-    1. Stops any ongoing TTS
-    2. Plays handoff message
-    3. Initiates Twilio call transfer
-    4. Logs transfer event
-    5. Closes WebSocket connection
-    
-    Args:
-        call_id: Twilio call SID
-        websocket: Active WebSocket connection
-        transfer_number: Phone number to transfer to (E.164 format)
-        reason: Reason for transfer
-        
-    Raises:
-        RuntimeError: If transfer fails
-    """
+async def _execute_transfer(conn: CallConnection, transfer_details: Dict[str, Any]):
+    """Execute call transfer."""
     try:
-        session = active_calls.get(call_id)
+        transfer_number = transfer_details.get("transfer_number")
+        reason = transfer_details.get("reason", "Customer request")
         
-        if not session:
-            raise RuntimeError(f"No active session for call: {call_id}")
+        if not transfer_number:
+            logger.error("Transfer requested but no number provided")
+            return
         
-        logger.info(f"Executing call transfer: {call_id} -> {transfer_number}")
+        logger.info(f"Executing transfer for {conn.call_id} to {transfer_number}")
         
-        # Mark transfer in progress
-        session.transfer_in_progress = True
-        session.mark_transfer_requested()
+        conn.transfer_in_progress = True
+        conn.mark_transfer_requested()
         
-        # Stop any ongoing TTS
-        if session.is_speaking:
-            await session.stop_tts()
+        # Stop TTS
+        await conn.stop_tts()
         
         # Play handoff message
-        handoff_message = "One moment please, I'm transferring you to a team member."
+        handoff = "One moment please, I'm transferring you to a team member."
         
-        # Translate handoff message if needed
-        if session.detected_language and session.detected_language != "en":
+        if conn.detected_language and conn.detected_language != "en":
             try:
                 from translate import from_english
-                handoff_message = await from_english(
-                    handoff_message,
-                    session.detected_language
-                )
-            except Exception as e:
-                logger.warning(f"Failed to translate handoff message: {str(e)}")
+                handoff = await from_english(handoff, conn.detected_language)
+            except:
+                pass
         
-        # Stream handoff message
-        try:
-            handoff_token = CancellationToken()
-            await stream_tts(
-                text=handoff_message,
-                language_code=session.detected_language or "en",
-                websocket=websocket,
-                cancellation_token=handoff_token
-            )
-        except Exception as e:
-            logger.warning(f"Failed to play handoff message: {str(e)}")
+        token = CancellationToken()
+        from tts_streaming import stream_tts
+        await stream_tts(
+            text=handoff,
+            language_code=conn.detected_language or "en",
+            websocket=conn.websocket,
+            call_id=conn.call_id,
+            cancel_event=token
+        )
         
-        # Small delay to ensure message is heard
         await asyncio.sleep(0.5)
         
-        # Initiate Twilio transfer using API
+        # Execute Twilio transfer
         from twilio.rest import Client
         from config import get_config
         
         config = get_config()
-        twilio_client = Client(
-            config.twilio.account_sid,
-            config.twilio.auth_token
-        )
+        client = Client(config.twilio.account_sid, config.twilio.auth_token)
         
-        # Update the call to transfer
-        try:
-            call = twilio_client.calls(call_id).update(
-                twiml=f'''<?xml version="1.0" encoding="UTF-8"?>
+        call = client.calls(conn.call_id).update(
+            twiml=f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial>
         <Number>{transfer_number}</Number>
     </Dial>
 </Response>'''
-            )
-            
-            logger.info(f"Twilio transfer initiated: {call_id}")
-            
-        except Exception as e:
-            logger.error(f"Twilio transfer failed: {str(e)}")
-            raise RuntimeError(f"Failed to transfer call: {str(e)}")
+        )
         
-        # Log transfer to database
-        try:
-            # Update call log with transfer info
-            from db import db
-            db.store_call_log({
-                "restaurant_id": session.restaurant_id,
-                "caller_phone": session.customer_phone or "unknown",
-                "call_sid": call_id,
-                "direction": "inbound",
-                "status": "transferred",
-                "transcript": f"Call transferred to {transfer_number}. Reason: {reason}"
-            })
-            
-            logger.info(f"Transfer logged to database: {call_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to log transfer to database: {str(e)}")
+        logger.info(f"Transfer initiated: {conn.call_id}")
         
-        # Clean up session (don't call handle_call_end to avoid circular import)
-        # Cleanup will happen naturally through _cleanup_call
-        if call_id in active_calls:
-            del active_calls[call_id]
+        # Log to database
+        from db import db
+        db.store_call_log({
+            "restaurant_id": conn.restaurant_id,
+            "caller_phone": conn.customer_phone or "unknown",
+            "call_sid": conn.call_id,
+            "direction": "inbound",
+            "status": "transferred",
+            "transcript": f"Transferred to {transfer_number}. Reason: {reason}"
+        })
         
-        logger.info(f"Call transfer complete: {call_id}")
+        await conn.close("transferred")
         
     except Exception as e:
-        logger.error(f"Call transfer execution failed: {str(e)}", exc_info=True)
+        logger.error(f"Transfer failed: {str(e)}", exc_info=True)
         
-        # Try to inform caller of error
-        try:
-            error_message = "I apologize, but I'm unable to transfer your call at this time. Please try calling back."
-            
-            if session and session.detected_language and session.detected_language != "en":
+        # Inform user
+        error_msg = "I apologize, but I'm unable to transfer your call right now."
+        
+        if conn.detected_language and conn.detected_language != "en":
+            try:
                 from translate import from_english
-                error_message = await from_english(error_message, session.detected_language)
-            
-            error_token = CancellationToken()
-            await stream_tts(
-                text=error_message,
-                language_code=session.detected_language if session else "en",
-                websocket=websocket,
-                cancellation_token=error_token
-            )
-        except:
-            pass
+                error_msg = await from_english(error_msg, conn.detected_language)
+            except:
+                pass
         
-        raise
+        token = CancellationToken()
+        from tts_streaming import stream_tts
+        await stream_tts(
+            text=error_msg,
+            language_code=conn.detected_language or "en",
+            websocket=conn.websocket,
+            call_id=conn.call_id,
+            cancel_event=token
+        )
 
 
-async def _cleanup_call(call_sid: str):
-    """
-    Clean up call session and finalize in database.
-    
-    Args:
-        call_sid: Call SID to clean up
-    """
-    try:
-        session = active_calls.get(call_sid)
-        
-        if not session:
-            return
-        
-        logger.info(f"Cleaning up call: {call_sid}")
-        
-        # Stop any ongoing TTS
-        if session.is_speaking:
-            await session.stop_tts()
-        
-        # Finalize call in business logic
+async def _cleanup_loop():
+    """Background cleanup of stale connections."""
+    while not _shutdown_event.is_set():
         try:
-            await handle_call_end(call_sid)
-        except Exception as e:
-            logger.error(f"Error finalizing call {call_sid}: {str(e)}")
-        
-        # Remove from active calls
-        if call_sid in active_calls:
-            del active_calls[call_sid]
-        
-        logger.info(f"Call cleanup complete: {call_sid}")
-        
-    except Exception as e:
-        logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
-
-
-# ============================================================================
-# BACKGROUND TASKS
-# ============================================================================
-
-async def cleanup_stale_calls():
-    """
-    Background task to clean up stale call sessions.
-    Runs periodically to remove inactive calls.
-    """
-    stale_threshold = 300  # 5 minutes
-    
-    while True:
-        try:
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(60)
             
             now = datetime.utcnow()
-            stale_calls = []
+            stale = []
             
-            for call_sid, session in active_calls.items():
-                idle_time = (now - session.last_activity).total_seconds()
+            for call_id, conn in _active_connections.items():
+                idle_time = (now - conn.last_activity).total_seconds()
                 
-                if idle_time > stale_threshold:
-                    stale_calls.append(call_sid)
+                if idle_time > 300:
+                    stale.append(call_id)
             
-            # Clean up stale calls
-            for call_sid in stale_calls:
-                logger.warning(f"Cleaning up stale call: {call_sid}")
-                await _cleanup_call(call_sid)
-        
+            for call_id in stale:
+                logger.warning(f"Cleaning up stale connection: {call_id}")
+                conn = _active_connections.get(call_id)
+                if conn:
+                    await conn.close("stale_timeout")
+                _active_connections.pop(call_id, None)
+            
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Error in cleanup task: {str(e)}")
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks on server startup."""
-    asyncio.create_task(cleanup_stale_calls())
-    logger.info("WebSocket server started")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up all active calls on shutdown."""
-    logger.info("Shutting down server...")
-    
-    # Clean up all active calls
-    call_sids = list(active_calls.keys())
-    for call_sid in call_sids:
-        await _cleanup_call(call_sid)
-    
-    logger.info("Server shutdown complete")
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
-def main():
-    """Run the WebSocket server."""
-    # Validate configuration
-    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        logger.error("Missing Twilio credentials in environment")
-        raise RuntimeError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN required")
-    
-    logger.info(f"Starting server on {HOST}:{PORT}")
-    logger.info(f"Base URL: {BASE_URL}")
-    
-    # Run server
-    uvicorn.run(
-        app,
-        host=HOST,
-        port=PORT,
-        log_level="info",
-        access_log=True
-    )
+            logger.error(f"Cleanup error: {str(e)}")
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    from config import get_config
+    config = get_config()
+    
+    logger.info("Starting WebSocket Audio Gateway")
+    logger.info(f"Host: {config.server.host}")
+    logger.info(f"Port: {config.server.port}")
+    
+    uvicorn.run(
+        app,
+        host=config.server.host,
+        port=config.server.port,
+        log_level="info"
+    )
