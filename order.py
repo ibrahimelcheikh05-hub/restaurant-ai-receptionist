@@ -413,6 +413,7 @@ class Order:
         
         if is_valid:
             logger.info(f"Order {self.order_id} validation passed")
+            # Stay in VALIDATING state - finalize() will transition to FINALIZED
         else:
             logger.warning(f"Order {self.order_id} validation failed: {errors}")
             self._transition(OrderState.BUILDING)
