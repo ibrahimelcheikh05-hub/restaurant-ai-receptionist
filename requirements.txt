@@ -1,29 +1,132 @@
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
-websockets==12.0
-python-multipart==0.0.9
+# ==============================================================================
+# PRODUCTION DEPENDENCIES
+# ==============================================================================
+# Voice AI Ordering System
+# Python Version: 3.10+
+# Last Updated: 2026-01-21
+#
+# Installation:
+#   pip install -r requirements.txt --break-system-packages
+# ==============================================================================
 
-vocode==0.1.113
+# ==============================================================================
+# CORE WEB FRAMEWORK
+# ==============================================================================
+fastapi==0.109.0              # Async web framework
+uvicorn[standard]==0.27.0     # ASGI server with uvloop
+websockets==12.0              # WebSocket support
+python-multipart==0.0.6       # Form data parsing
 
-twilio==8.13.0
+# ==============================================================================
+# AI / LLM
+# ==============================================================================
+anthropic==0.18.1             # Claude API (async-native)
+openai==1.12.0                # OpenAI API (optional, async-native)
 
-google-cloud-speech==2.24.1
-google-cloud-texttospeech==2.16.3
-google-cloud-translate==3.15.0
+# ==============================================================================
+# SPEECH SERVICES (GOOGLE CLOUD)
+# ==============================================================================
+google-cloud-speech==2.24.0   # Speech-to-Text (streaming)
+google-cloud-texttospeech==2.16.3  # Text-to-Speech (streaming)
+google-cloud-translate==3.15.0     # Translation API
+google-auth==2.28.0           # Google authentication
+google-api-core==2.17.0       # Google API core
 
-anthropic==0.18.1
-openai==1.12.0
+# ==============================================================================
+# TELEPHONY (TWILIO)
+# ==============================================================================
+twilio==9.0.0                 # Twilio API (async-compatible)
 
-supabase==2.3.5
-postgrest==0.16.0
+# ==============================================================================
+# DATABASE (SUPABASE / POSTGRES)
+# ==============================================================================
+supabase==2.3.4               # Supabase client
+postgrest==0.13.2             # PostgREST client
+httpx==0.26.0                 # Async HTTP client (for Supabase)
 
-python-dotenv==1.0.1
-pydantic==2.6.1
-pydantic-settings==2.1.0
+# ==============================================================================
+# CONFIGURATION & VALIDATION
+# ==============================================================================
+pydantic==2.6.1               # Data validation (v2)
+pydantic-settings==2.1.0      # Settings management
+python-dotenv==1.0.1          # .env file support
 
-structlog==24.1.0
+# ==============================================================================
+# LANGUAGE DETECTION
+# ==============================================================================
+langdetect==1.0.9             # Fast language detection
 
-aiohttp==3.9.3
-httpx==0.26.0
+# ==============================================================================
+# DOCUMENT PROCESSING (OPTIONAL)
+# ==============================================================================
+python-docx==1.1.0            # Word documents (if needed)
+openpyxl==3.1.2               # Excel files (if needed)
 
-langdetect==1.0.9
+# ==============================================================================
+# ASYNC UTILITIES
+# ==============================================================================
+asyncio==3.4.3                # Async I/O support
+aiofiles==23.2.1              # Async file operations
+aiodns==3.1.1                 # Async DNS resolution
+
+# ==============================================================================
+# OBSERVABILITY & LOGGING
+# ==============================================================================
+prometheus-client==0.19.0     # Prometheus metrics
+structlog==24.1.0             # Structured logging
+python-json-logger==2.0.7     # JSON logging
+
+# ==============================================================================
+# MONITORING & TRACING (OPTIONAL)
+# ==============================================================================
+# opentelemetry-api==1.22.0        # OpenTelemetry tracing
+# opentelemetry-sdk==1.22.0        # OpenTelemetry SDK
+# opentelemetry-instrumentation-fastapi==0.43b0  # FastAPI instrumentation
+
+# ==============================================================================
+# SECURITY
+# ==============================================================================
+cryptography==42.0.2          # Encryption utilities
+python-jose[cryptography]==3.3.0  # JWT tokens (if needed)
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+python-dateutil==2.8.2        # Date parsing
+pytz==2024.1                  # Timezone support
+click==8.1.7                  # CLI utilities
+
+# ==============================================================================
+# TESTING (DEVELOPMENT ONLY)
+# ==============================================================================
+# pytest==8.0.0                    # Testing framework
+# pytest-asyncio==0.23.4           # Async test support
+# pytest-cov==4.1.0                # Coverage reporting
+# httpx==0.26.0                    # HTTP testing
+# faker==22.6.0                    # Test data generation
+
+# ==============================================================================
+# TYPE CHECKING (DEVELOPMENT ONLY)
+# ==============================================================================
+# mypy==1.8.0                      # Static type checker
+# types-requests==2.31.0.20240125  # Type stubs for requests
+
+# ==============================================================================
+# CODE QUALITY (DEVELOPMENT ONLY)
+# ==============================================================================
+# black==24.1.1                    # Code formatter
+# isort==5.13.2                    # Import sorter
+# flake8==7.0.0                    # Linter
+# pylint==3.0.3                    # Advanced linter
+
+# ==============================================================================
+# NOTES
+# ==============================================================================
+# - All packages are pinned to specific versions for reproducibility
+# - Async-native libraries preferred for non-blocking I/O
+# - Google Cloud libraries support streaming operations
+# - Twilio library is async-compatible via run_in_executor
+# - Development dependencies are commented out (uncomment for dev environments)
+# - Use virtual environment: python3 -m venv venv && source venv/bin/activate
+# - Update versions carefully and test thoroughly before deploying
+# ==============================================================================
