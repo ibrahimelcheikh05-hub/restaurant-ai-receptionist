@@ -36,6 +36,13 @@ except ImportError:
     GOOGLE_AVAILABLE = False
     texttospeech = None
 
+# Latency tracking
+try:
+    from latency_tracker import track_latency_async, LatencyType
+    LATENCY_TRACKING_ENABLED = True
+except ImportError:
+    LATENCY_TRACKING_ENABLED = False
+
 try:
     from prometheus_client import Counter, Histogram, Gauge
     METRICS_ENABLED = True
@@ -407,8 +414,8 @@ def _get_client():
     return _client
 
 
-async def _synthesize_audio(text: str, language: str) -> Optional[bytes]:
-    """Synthesize audio with caching."""
+async def _synthesize_audio(text: str, language: str, call_id: str = "system") -> Optional[bytes]:
+    """Synthesize audio with caching and latency tracking."""
     # Check cache first
     cached = _cache.get(text, language)
     if cached:
@@ -446,16 +453,28 @@ async def _synthesize_audio(text: str, language: str) -> Optional[bytes]:
     )
     
     try:
-        # Synthesize (blocking call)
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
+        # Synthesize WITH LATENCY TRACKING
+        if LATENCY_TRACKING_ENABLED:
+            async with track_latency_async(call_id, LatencyType.TTS, "google_synthesize"):
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client.synthesize_speech(
+                        input=synthesis_input,
+                        voice=voice,
+                        audio_config=audio_config
+                    )
+                )
+        else:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.synthesize_speech(
+                    input=synthesis_input,
+                    voice=voice,
+                    audio_config=audio_config
+                )
             )
-        )
         
         audio_data = response.audio_content
         
