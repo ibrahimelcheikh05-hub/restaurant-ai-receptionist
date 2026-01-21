@@ -65,7 +65,7 @@ openpyxl==3.1.2               # Excel files (if needed)
 # ==============================================================================
 # ASYNC UTILITIES
 # ==============================================================================
-asyncio==3.4.3                # Async I/O support
+# asyncio is Python stdlib - DO NOT install separately
 aiofiles==23.2.1              # Async file operations
 aiodns==3.1.1                 # Async DNS resolution
 
