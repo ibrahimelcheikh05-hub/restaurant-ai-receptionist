@@ -266,24 +266,12 @@ class CallSession:
 _active_sessions: Dict[str, CallSession] = {}
 
 
-def _get_llm_client():
-    """Get LLM client based on configuration."""
-    provider = os.getenv("LLM_PROVIDER", "claude").lower()
-    
-    if provider == "claude":
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set")
-        return AsyncAnthropic(api_key=api_key), "claude"
-    
-    elif provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY not set")
-        return AsyncOpenAI(api_key=api_key), "openai"
-    
-    else:
-        raise RuntimeError(f"Unknown LLM provider: {provider}")
+# ============================================================================
+# OPENAI GPT-4o-mini CLIENT (ENTERPRISE v2.0)
+# ============================================================================
+
+# Initialize OpenAI client
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 async def handle_call_start(
@@ -572,7 +560,7 @@ async def handle_call_end(call_id: str) -> Dict[str, Any]:
 
 async def _generate_ai_response(session: CallSession, user_text: str) -> Optional[str]:
     """
-    Generate AI response using LLM.
+    Generate AI response using GPT-4o-mini.
     
     Args:
         session: Call session
@@ -619,34 +607,14 @@ Conversation History:
         
         user_message = f"{context}\n\nCustomer: {user_text}\n\nRespond naturally and helpfully:"
         
-        # Call LLM
-        client, provider = _get_llm_client()
+        # Call GPT-4o-mini using the new get_ai_response function
+        response = await get_ai_response(
+            prompt=user_message,
+            system_prompt=system_prompt,
+            call_session=session
+        )
         
-        if provider == "claude":
-            response = await client.messages.create(
-                model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_message}
-                ]
-            )
-            
-            return response.content[0].text.strip()
-        
-        elif provider == "openai":
-            response = await client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4"),
-                max_tokens=1024,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ]
-            )
-            
-            return response.choices[0].message.content.strip()
-        
-        return None
+        return response.strip() if response else None
         
     except Exception as e:
         logger.error(f"AI generation error: {str(e)}", exc_info=True)
@@ -836,11 +804,8 @@ def get_call_analytics() -> Dict[str, Any]:
 
 
 # ============================================================================
-# OPENAI CLIENT INITIALIZATION
+# AI RESPONSE FUNCTIONS (Already initialized above)
 # ============================================================================
-
-# Initialize OpenAI client
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 async def get_ai_response(
