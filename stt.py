@@ -44,6 +44,13 @@ except ImportError:
     DEEPGRAM_AVAILABLE = False
     logger.warning("Deepgram SDK not installed. Install: pip install deepgram-sdk")
 
+# Latency tracking
+try:
+    from latency_tracker import get_tracker, LatencyType
+    LATENCY_TRACKING_ENABLED = True
+except ImportError:
+    LATENCY_TRACKING_ENABLED = False
+
 try:
     from prometheus_client import Counter, Histogram, Gauge
     METRICS_ENABLED = True
@@ -263,7 +270,9 @@ class DeepgramSTTStream:
         return samples < 5  # Threshold for silence
     
     async def _on_message(self, *args, **kwargs):
-        """Handle transcript from Deepgram."""
+        """Handle transcript from Deepgram with latency tracking."""
+        transcription_start = time.time()
+        
         try:
             # Extract result from args
             result = args[1] if len(args) > 1 else args[0]
@@ -298,6 +307,21 @@ class DeepgramSTTStream:
             # Store transcript
             if is_final:
                 self.transcripts.append(transcript)
+                
+                # TRACK LATENCY
+                if LATENCY_TRACKING_ENABLED:
+                    transcription_latency_ms = (time.time() - transcription_start) * 1000
+                    tracker = get_tracker(self.session_id)
+                    tracker.track_latency(
+                        LatencyType.STT,
+                        transcription_latency_ms,
+                        operation="deepgram_transcribe",
+                        metadata={
+                            "confidence": confidence,
+                            "word_count": len(transcript_text.split()),
+                            "is_final": True
+                        }
+                    )
                 
                 # Track words
                 word_count = len(transcript_text.split())
