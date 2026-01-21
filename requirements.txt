@@ -23,6 +23,11 @@ python-multipart==0.0.6       # Form data parsing
 openai==1.12.0                # OpenAI GPT-4o-mini (PRIMARY - async-native)
 
 # ==============================================================================
+# VOICE PIPELINE ORCHESTRATION
+# ==============================================================================
+vocode==0.1.112               # Voice conversation orchestration
+
+# ==============================================================================
 # SPEECH SERVICES (GOOGLE CLOUD)
 # ==============================================================================
 google-cloud-speech==2.24.0   # Speech-to-Text (streaming)
