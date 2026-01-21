@@ -20,8 +20,7 @@ python-multipart==0.0.6       # Form data parsing
 # ==============================================================================
 # AI / LLM
 # ==============================================================================
-anthropic==0.18.1             # Claude API (async-native)
-openai==1.12.0                # OpenAI API (optional, async-native)
+openai==1.12.0                # OpenAI GPT-4o-mini (PRIMARY - async-native)
 
 # ==============================================================================
 # SPEECH SERVICES (GOOGLE CLOUD)
