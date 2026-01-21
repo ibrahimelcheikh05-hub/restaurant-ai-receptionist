@@ -297,16 +297,6 @@ class ProductionConfig(BaseSettings):
         env="SYSTEM_AGENT_PROMPT"
     )
     
-    # LLM provider
-    llm_provider: str = Field("claude", env="LLM_PROVIDER")
-    
-    @validator("llm_provider")
-    def validate_llm_provider(cls, v):
-        """Validate LLM provider."""
-        if v not in ["claude", "openai"]:
-            raise ValueError(f"Unknown LLM provider: {v}")
-        return v
-    
     @validator("log_level")
     def validate_log_level(cls, v):
         """Validate log level."""
