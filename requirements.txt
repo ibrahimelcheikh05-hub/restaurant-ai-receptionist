@@ -28,10 +28,11 @@ openai==1.12.0                # OpenAI GPT-4o-mini (PRIMARY - async-native)
 vocode==0.1.112               # Voice conversation orchestration
 
 # ==============================================================================
-# SPEECH SERVICES (GOOGLE CLOUD)
+# SPEECH SERVICES (OPTIMIZED v3.0)
 # ==============================================================================
-google-cloud-speech==2.24.0   # Speech-to-Text (streaming)
-google-cloud-texttospeech==2.16.3  # Text-to-Speech (streaming)
+# COST OPTIMIZATION: Deepgram STT ($0.0043/min vs Google $0.024/min - 82% cheaper)
+deepgram-sdk==3.2.0           # Deepgram STT (Nova-2 model - OPTIMIZED)
+google-cloud-texttospeech==2.16.3  # Text-to-Speech (keeping Google)
 google-cloud-translate==3.15.0     # Translation API
 google-auth==2.28.0           # Google authentication
 google-api-core==2.17.0       # Google API core
