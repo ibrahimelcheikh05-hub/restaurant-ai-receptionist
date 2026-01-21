@@ -29,6 +29,14 @@ import uuid
 
 from openai import AsyncOpenAI
 
+# Latency tracking module
+try:
+    from latency_tracker import get_tracker, remove_tracker, track_latency_async, LatencyType
+    LATENCY_TRACKING_ENABLED = True
+except ImportError:
+    LATENCY_TRACKING_ENABLED = False
+    logger.warning("latency_tracker not available - latency tracking disabled")
+
 from memory import create_call_memory, get_memory, clear_memory, CallMemory
 from db import db
 from menu import get_menu, format_menu_for_prompt
@@ -549,6 +557,22 @@ async def handle_call_end(call_id: str) -> Dict[str, Any]:
         # Clear memory
         clear_memory(call_id)
         
+        # GET LATENCY SUMMARY
+        if LATENCY_TRACKING_ENABLED:
+            latency_summary = remove_tracker(call_id)
+            if latency_summary:
+                logger.info(f"📊 Latency Summary for {call_id}:")
+                logger.info(f"   Duration: {latency_summary.get('session_duration_seconds', 0):.1f}s")
+                logger.info(f"   Measurements: {latency_summary.get('total_measurements', 0)}")
+                
+                for component, stats in latency_summary.get('stats_by_component', {}).items():
+                    logger.info(
+                        f"   {component}: "
+                        f"mean={stats.get('mean_ms', 0):.1f}ms, "
+                        f"p95={stats.get('p95_ms', 0):.1f}ms, "
+                        f"count={stats.get('count', 0)}"
+                    )
+        
         logger.info(f"Call ended: {call_id}")
         
         return {"status": "ended", "call_id": call_id}
@@ -814,7 +838,7 @@ async def get_ai_response(
     call_session: Optional['CallSession'] = None
 ) -> str:
     """
-    Get AI response from GPT-4o-mini.
+    Get AI response from GPT-4o-mini with latency tracking.
     
     Args:
         prompt: User prompt
@@ -827,6 +851,9 @@ async def get_ai_response(
     try:
         start_time = time.time()
         
+        # Get call_id for latency tracking
+        call_id = call_session.call_id if call_session else "unknown"
+        
         # Build messages
         messages = []
         if system_prompt:
@@ -838,13 +865,22 @@ async def get_ai_response(
         max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
         temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
         
-        # Make request
-        response = await openai_client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=messages
-        )
+        # Make request WITH LATENCY TRACKING
+        if LATENCY_TRACKING_ENABLED:
+            async with track_latency_async(call_id, LatencyType.LLM, "gpt4o_mini"):
+                response = await openai_client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=messages
+                )
+        else:
+            response = await openai_client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=messages
+            )
         
         # Extract response
         ai_text = response.choices[0].message.content
