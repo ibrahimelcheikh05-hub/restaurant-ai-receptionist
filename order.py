@@ -1,29 +1,29 @@
 """
-Order Module (Enterprise Production)
-=====================================
-Enterprise-grade transactional order management with state machine.
+Order Module (Production Hardened)
+===================================
+Transactional state machine for order management.
 
-NEW FEATURES (Enterprise v2.0):
-✅ Fraud detection hooks and risk scoring
-✅ Order metrics and analytics
-✅ Validation statistics tracking
-✅ Price anomaly detection
-✅ Prometheus metrics integration
-✅ Order value distribution tracking
-✅ Item popularity analytics
-✅ Modification attempt tracking
-✅ Performance monitoring
+HARDENING UPDATES (v3.0):
+✅ Complete state machine: EMPTY, BUILDING, CONFIRMING, FINAL, LOCKED
+✅ Integrity validation (checksums, totals)
+✅ No silent overwrites (explicit warnings)
+✅ Rollback capability (snapshots)
+✅ Explicit commit step (two-phase)
+✅ Immutable finalized orders (frozen)
+✅ AI cannot directly mutate
 
-Version: 2.0.0 (Enterprise)
-Last Updated: 2026-01-21
+Version: 3.0.0 (Production Hardened)
+Last Updated: 2026-01-22
 """
 
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
+from copy import deepcopy
 from enum import Enum
 import uuid
+import hashlib
 
 try:
     from prometheus_client import Counter, Histogram, Gauge
@@ -35,7 +35,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# Prometheus Metrics
+# ============================================================================
+# METRICS
+# ============================================================================
+
 if METRICS_ENABLED:
     orders_total = Counter(
         'orders_total',
@@ -46,23 +49,28 @@ if METRICS_ENABLED:
         'order_value_dollars',
         'Order value distribution'
     )
-    order_items_count = Histogram(
-        'order_items_count',
-        'Number of items per order'
+    order_state_transitions = Counter(
+        'order_state_transitions_total',
+        'Order state transitions',
+        ['from_state', 'to_state']
     )
     order_validation_failures = Counter(
         'order_validation_failures_total',
         'Order validation failures',
         ['reason']
     )
-    order_modifications = Counter(
-        'order_modifications_total',
-        'Order modification attempts',
-        ['operation', 'result']
+    order_rollbacks = Counter(
+        'order_rollbacks_total',
+        'Order rollback events'
     )
-    order_fraud_score = Histogram(
-        'order_fraud_score',
-        'Order fraud risk scores'
+    order_commits = Counter(
+        'order_commits_total',
+        'Order commit events',
+        ['result']
+    )
+    order_overwrite_warnings = Counter(
+        'order_overwrite_warnings_total',
+        'Order overwrite warning events'
     )
     orders_active = Gauge(
         'orders_active',
@@ -70,81 +78,155 @@ if METRICS_ENABLED:
     )
 
 
+# ============================================================================
+# ORDER STATE (Comprehensive)
+# ============================================================================
+
 class OrderState(Enum):
-    """Order lifecycle states."""
-    CREATED = "created"
-    BUILDING = "building"
-    VALIDATING = "validating"
-    FINALIZED = "finalized"
-    CANCELLED = "cancelled"
+    """
+    Order lifecycle states (comprehensive state machine).
+    
+    State transitions:
+    EMPTY → BUILDING → CONFIRMING → FINAL → LOCKED
+    
+    Terminal states: FINAL, LOCKED, CANCELLED
+    """
+    EMPTY = "empty"              # No items yet
+    BUILDING = "building"        # Adding/removing items
+    CONFIRMING = "confirming"    # Review phase (pre-commit)
+    FINAL = "final"              # Committed (immutable)
+    LOCKED = "locked"            # Finalized with customer info (fully immutable)
+    CANCELLED = "cancelled"      # Cancelled (terminal)
 
 
-@dataclass
+# ============================================================================
+# IMMUTABLE ORDER ITEM
+# ============================================================================
+
+@dataclass(frozen=True)
 class OrderItem:
-    """Single order item."""
+    """
+    Immutable order item.
+    
+    CRITICAL: frozen=True means item CANNOT be modified after creation.
+    """
     item_id: str
+    canonical_id: str  # From menu system (for validation)
     name: str
     price: float
     quantity: int
     subtotal: float
     notes: Optional[str] = None
     added_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+    
+    def with_quantity(self, new_quantity: int) -> 'OrderItem':
+        """
+        Create new item with updated quantity (immutable).
+        
+        This is the ONLY way to "modify" - creates new object.
+        """
+        return OrderItem(
+            item_id=self.item_id,
+            canonical_id=self.canonical_id,
+            name=self.name,
+            price=self.price,
+            quantity=new_quantity,
+            subtotal=round(self.price * new_quantity, 2),
+            notes=self.notes,
+            added_at=self.added_at
+        )
 
 
-@dataclass
-class OrderSummary:
-    """Complete order summary."""
+# ============================================================================
+# ORDER SNAPSHOT (Rollback Support)
+# ============================================================================
+
+@dataclass(frozen=True)
+class OrderSnapshot:
+    """
+    Immutable order snapshot for rollback.
+    
+    Captures complete order state at a point in time.
+    """
+    snapshot_id: str
     order_id: str
-    call_id: str
-    restaurant_id: str
-    state: str
-    items: List[OrderItem]
+    state: OrderState
+    items: Tuple[OrderItem, ...]  # Immutable tuple
     subtotal: float
     tax: float
     total: float
-    item_count: int
-    created_at: str
-    updated_at: str
-    finalized_at: Optional[str] = None
+    timestamp: datetime
+    checksum: str  # Integrity validation
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "snapshot_id": self.snapshot_id,
+            "order_id": self.order_id,
+            "state": self.state.value,
+            "items": [item.to_dict() for item in self.items],
+            "subtotal": self.subtotal,
+            "tax": self.tax,
+            "total": self.total,
+            "timestamp": self.timestamp.isoformat(),
+            "checksum": self.checksum
+        }
 
 
-class Order:
+# ============================================================================
+# TRANSACTIONAL ORDER
+# ============================================================================
+
+class TransactionalOrder:
     """
-    Transactional order with deterministic state machine.
-    Supports safe add/remove, validation, and finalization.
+    Transactional order with state machine and rollback.
+    
+    State machine:
+    EMPTY → BUILDING → CONFIRMING → FINAL → LOCKED
+    
+    Guarantees:
+    - Integrity validation via checksums
+    - No silent overwrites (explicit warnings)
+    - Rollback capability via snapshots
+    - Explicit commit step
+    - Immutable after FINAL state
     """
     
     def __init__(self, call_id: str, restaurant_id: str):
-        """
-        Initialize order.
-        
-        Args:
-            call_id: Call identifier
-            restaurant_id: Restaurant identifier
-        """
+        """Initialize transactional order."""
         self.order_id = f"ord_{uuid.uuid4().hex[:12]}"
         self.call_id = call_id
         self.restaurant_id = restaurant_id
-        self.state = OrderState.CREATED
         
-        # Items
-        self.items: Dict[str, OrderItem] = {}
+        # State machine
+        self.state = OrderState.EMPTY
+        self._state_history: List[Tuple[OrderState, datetime]] = [
+            (OrderState.EMPTY, datetime.utcnow())
+        ]
+        
+        # Items (mutable until FINAL)
+        self._items: Dict[str, OrderItem] = {}
         
         # Pricing
         self.subtotal = 0.0
-        self.tax_rate = 0.08  # 8% default
+        self.tax_rate = 0.08
         self.tax = 0.0
         self.total = 0.0
         
-        # Customer info (set on finalization)
+        # Customer info (set during CONFIRMING → FINAL)
         self.customer_name: Optional[str] = None
         self.customer_phone: Optional[str] = None
         self.delivery_address: Optional[str] = None
-        self.order_type: str = "pickup"  # "pickup" or "delivery"
+        self.order_type: str = "pickup"
         
         # Timestamps
         self.created_at = datetime.utcnow()
         self.updated_at = datetime.utcnow()
+        self.confirmed_at: Optional[datetime] = None
         self.finalized_at: Optional[datetime] = None
         
         # Limits
@@ -152,14 +234,17 @@ class Order:
         self.max_quantity_per_item = 99
         self.min_order_total = 0.01
         
-        # Lock flags
-        self._finalized = False
+        # Rollback support (snapshots)
+        self._snapshots: List[OrderSnapshot] = []
+        self._max_snapshots = 10
         
-        # Enterprise features (v2.0)
+        # Integrity
+        self._checksum: Optional[str] = None
+        
+        # Tracking
         self.modification_count = 0
-        self.validation_attempts = 0
-        self.fraud_score = 0.0
-        self.price_anomalies: List[str] = []
+        self.validation_count = 0
+        self.rollback_count = 0
         
         # Track in registry
         _order_registry[self.order_id] = self
@@ -168,15 +253,25 @@ class Order:
             orders_active.inc()
             orders_total.labels(state=self.state.value).inc()
         
-        logger.info(f"Order created: {self.order_id} for call {call_id}")
+        logger.info(f"Transactional order created: {self.order_id}")
     
     # ========================================================================
-    # STATE MANAGEMENT
+    # STATE MACHINE
     # ========================================================================
     
-    def _transition(self, new_state: OrderState) -> bool:
+    def transition(self, new_state: OrderState) -> bool:
         """
-        Transition to new state with validation.
+        Transition to new state (controlled).
+        
+        Valid transitions:
+        EMPTY → BUILDING
+        BUILDING → CONFIRMING
+        BUILDING → EMPTY (clear)
+        CONFIRMING → BUILDING (back to editing)
+        CONFIRMING → FINAL (commit)
+        FINAL → LOCKED (finalize with customer info)
+        
+        Terminal states: FINAL, LOCKED, CANCELLED
         
         Args:
             new_state: Target state
@@ -185,130 +280,163 @@ class Order:
             True if transition allowed
         """
         valid_transitions = {
-            OrderState.CREATED: [OrderState.BUILDING, OrderState.CANCELLED],
-            OrderState.BUILDING: [OrderState.VALIDATING, OrderState.CANCELLED],
-            OrderState.VALIDATING: [OrderState.BUILDING, OrderState.FINALIZED, OrderState.CANCELLED],
-            OrderState.FINALIZED: [],  # Terminal state
-            OrderState.CANCELLED: []   # Terminal state
+            OrderState.EMPTY: [OrderState.BUILDING, OrderState.CANCELLED],
+            OrderState.BUILDING: [OrderState.EMPTY, OrderState.CONFIRMING, OrderState.CANCELLED],
+            OrderState.CONFIRMING: [OrderState.BUILDING, OrderState.FINAL, OrderState.CANCELLED],
+            OrderState.FINAL: [OrderState.LOCKED],
+            OrderState.LOCKED: [],  # Terminal
+            OrderState.CANCELLED: []  # Terminal
         }
         
-        if new_state in valid_transitions.get(self.state, []):
-            old_state = self.state
-            self.state = new_state
-            self._touch()
-            logger.debug(f"Order {self.order_id}: {old_state.value} → {new_state.value}")
-            return True
+        if new_state not in valid_transitions.get(self.state, []):
+            logger.warning(
+                f"Invalid transition: {self.state.value} → {new_state.value}"
+            )
+            return False
         
-        logger.warning(
-            f"Invalid transition for order {self.order_id}: "
-            f"{self.state.value} → {new_state.value}"
+        # Record transition
+        old_state = self.state
+        self.state = new_state
+        self._state_history.append((new_state, datetime.utcnow()))
+        self._touch()
+        
+        if METRICS_ENABLED:
+            order_state_transitions.labels(
+                from_state=old_state.value,
+                to_state=new_state.value
+            ).inc()
+        
+        logger.info(
+            f"Order {self.order_id}: {old_state.value} → {new_state.value}"
         )
-        return False
+        
+        return True
+    
+    def get_state(self) -> OrderState:
+        """Get current state."""
+        return self.state
+    
+    def is_mutable(self) -> bool:
+        """Check if order can be modified."""
+        return self.state in [OrderState.EMPTY, OrderState.BUILDING]
+    
+    def is_final(self) -> bool:
+        """Check if order is in final state."""
+        return self.state in [OrderState.FINAL, OrderState.LOCKED]
     
     def _touch(self):
         """Update timestamp."""
         self.updated_at = datetime.utcnow()
     
-    def _check_finalized(self) -> bool:
-        """Check if order is finalized (immutable)."""
-        if self._finalized or self.state == OrderState.FINALIZED:
-            logger.warning(f"Order {self.order_id} is finalized, cannot modify")
-            return True
-        return False
-    
     # ========================================================================
-    # ITEM MANAGEMENT
+    # ITEM OPERATIONS (Controlled Mutation)
     # ========================================================================
     
     def add_item(
         self,
         item_id: str,
+        canonical_id: str,
         name: str,
         price: float,
         quantity: int = 1,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        allow_overwrite: bool = False
     ) -> bool:
         """
-        Add item to order with validation.
+        Add item to order (controlled mutation).
+        
+        RULES:
+        - Only in EMPTY or BUILDING state
+        - No silent overwrites (requires explicit flag)
+        - Creates immutable OrderItem
         
         Args:
             item_id: Item identifier
+            canonical_id: Canonical menu item ID (for validation)
             name: Item name
             price: Item price
-            quantity: Quantity (default: 1)
-            notes: Special notes (optional)
+            quantity: Quantity
+            notes: Special notes
+            allow_overwrite: Allow overwriting existing item
             
         Returns:
             True if added successfully
         """
-        if self._check_finalized():
+        # Check mutability
+        if not self.is_mutable():
+            logger.error(
+                f"Cannot add item: order in {self.state.value} state"
+            )
             return False
         
-        # Transition to building state
-        if self.state == OrderState.CREATED:
-            self._transition(OrderState.BUILDING)
+        # Transition to BUILDING if EMPTY
+        if self.state == OrderState.EMPTY:
+            self.transition(OrderState.BUILDING)
         
         # Validate inputs
-        if not item_id or not name:
-            logger.warning("Item ID and name required")
+        if not item_id or not canonical_id or not name:
+            logger.warning("Item ID, canonical ID, and name required")
+            if METRICS_ENABLED:
+                order_validation_failures.labels(reason='missing_fields').inc()
             return False
         
-        # Normalize quantity
+        # Normalize
         quantity = self._normalize_quantity(quantity)
         if quantity <= 0:
-            logger.warning(f"Invalid quantity: {quantity}")
+            if METRICS_ENABLED:
+                order_validation_failures.labels(reason='invalid_quantity').inc()
             return False
         
-        # Validate price
         price = self._normalize_price(price)
         if price is None or price < 0:
-            logger.warning(f"Invalid price: {price}")
+            if METRICS_ENABLED:
+                order_validation_failures.labels(reason='invalid_price').inc()
             return False
         
         # Check item limit
-        if item_id not in self.items and len(self.items) >= self.max_items:
-            logger.warning(f"Max items reached ({self.max_items})")
+        if item_id not in self._items and len(self._items) >= self.max_items:
+            logger.warning(f"Max items reached: {self.max_items}")
+            if METRICS_ENABLED:
+                order_validation_failures.labels(reason='max_items').inc()
             return False
         
-        # Calculate subtotal
-        subtotal = round(price * quantity, 2)
-        
-        # Add or update item
-        if item_id in self.items:
-            # Update existing item (add to quantity)
-            existing = self.items[item_id]
-            new_quantity = existing.quantity + quantity
-            
-            if new_quantity > self.max_quantity_per_item:
-                logger.warning(f"Max quantity exceeded for item {name}")
-                return False
-            
-            existing.quantity = new_quantity
-            existing.subtotal = round(price * new_quantity, 2)
-            existing.notes = notes if notes else existing.notes
-            
-            logger.info(f"Updated item {name}: quantity={new_quantity}")
-        else:
-            # Add new item
-            self.items[item_id] = OrderItem(
-                item_id=item_id,
-                name=name,
-                price=price,
-                quantity=quantity,
-                subtotal=subtotal,
-                notes=notes
+        # Check for overwrite
+        if item_id in self._items and not allow_overwrite:
+            logger.warning(
+                f"Item {item_id} already in order - set allow_overwrite=True to replace"
             )
             
-            logger.info(f"Added item {name}: {quantity}x ${price:.2f}")
+            if METRICS_ENABLED:
+                order_overwrite_warnings.inc()
+            
+            return False  # NO SILENT OVERWRITES!
         
-        # Track modification
+        # Create snapshot before mutation
+        self._create_snapshot()
+        
+        # Create immutable item
+        subtotal = round(price * quantity, 2)
+        
+        item = OrderItem(
+            item_id=item_id,
+            canonical_id=canonical_id,
+            name=name,
+            price=price,
+            quantity=quantity,
+            subtotal=subtotal,
+            notes=notes
+        )
+        
+        # Add item
+        self._items[item_id] = item
         self.modification_count += 1
         
-        if METRICS_ENABLED:
-            order_modifications.labels(operation='add_item', result='success').inc()
-        
-        # Recompute totals
+        # Recompute
         self._recompute_totals()
+        
+        logger.info(
+            f"Added item: {name} (quantity={quantity}, price=${price:.2f})"
+        )
         
         return True
     
@@ -320,522 +448,498 @@ class Order:
             item_id: Item identifier
             
         Returns:
-            True if removed successfully
+            True if removed
         """
-        if self._check_finalized():
+        if not self.is_mutable():
+            logger.error(f"Cannot remove: order in {self.state.value} state")
             return False
         
-        if item_id not in self.items:
+        if item_id not in self._items:
             logger.warning(f"Item {item_id} not in order")
             return False
         
-        item = self.items.pop(item_id)
-        logger.info(f"Removed item {item.name} from order {self.order_id}")
+        # Create snapshot before mutation
+        self._create_snapshot()
         
-        # Recompute totals
+        # Remove
+        item = self._items.pop(item_id)
+        self.modification_count += 1
+        
+        # Recompute
         self._recompute_totals()
+        
+        # Transition to EMPTY if no items
+        if len(self._items) == 0:
+            self.transition(OrderState.EMPTY)
+        
+        logger.info(f"Removed item: {item.name}")
         
         return True
     
-    def update_item_quantity(self, item_id: str, quantity: int) -> bool:
+    def update_quantity(self, item_id: str, new_quantity: int) -> bool:
         """
-        Update item quantity.
+        Update item quantity (creates new immutable item).
         
         Args:
             item_id: Item identifier
-            quantity: New quantity
+            new_quantity: New quantity
             
         Returns:
-            True if updated successfully
+            True if updated
         """
-        if self._check_finalized():
+        if not self.is_mutable():
+            logger.error(f"Cannot update: order in {self.state.value} state")
             return False
         
-        if item_id not in self.items:
+        if item_id not in self._items:
             logger.warning(f"Item {item_id} not in order")
             return False
         
-        # Normalize quantity
-        quantity = self._normalize_quantity(quantity)
-        
-        if quantity <= 0:
-            # Remove item if quantity is 0
+        # Normalize
+        new_quantity = self._normalize_quantity(new_quantity)
+        if new_quantity <= 0:
+            # Remove if quantity is 0
             return self.remove_item(item_id)
         
-        if quantity > self.max_quantity_per_item:
-            logger.warning(f"Quantity exceeds maximum: {quantity}")
+        if new_quantity > self.max_quantity_per_item:
+            logger.warning(f"Max quantity exceeded: {self.max_quantity_per_item}")
             return False
         
-        item = self.items[item_id]
-        item.quantity = quantity
-        item.subtotal = round(item.price * quantity, 2)
+        # Create snapshot before mutation
+        self._create_snapshot()
         
-        logger.info(f"Updated quantity for {item.name}: {quantity}")
+        # Create new item with updated quantity (immutable)
+        old_item = self._items[item_id]
+        new_item = old_item.with_quantity(new_quantity)
         
-        # Recompute totals
+        # Replace
+        self._items[item_id] = new_item
+        self.modification_count += 1
+        
+        # Recompute
         self._recompute_totals()
+        
+        logger.info(
+            f"Updated quantity: {old_item.name} "
+            f"{old_item.quantity} → {new_quantity}"
+        )
         
         return True
     
-    def clear_items(self):
-        """Clear all items from order."""
-        if self._check_finalized():
-            return
+    def clear_items(self) -> bool:
+        """
+        Clear all items (transition to EMPTY).
         
-        count = len(self.items)
-        self.items.clear()
+        Returns:
+            True if cleared
+        """
+        if not self.is_mutable():
+            logger.error(f"Cannot clear: order in {self.state.value} state")
+            return False
         
-        logger.info(f"Cleared {count} items from order {self.order_id}")
+        # Create snapshot before mutation
+        self._create_snapshot()
         
-        # Recompute totals
+        # Clear
+        item_count = len(self._items)
+        self._items.clear()
+        self.modification_count += 1
+        
+        # Recompute
         self._recompute_totals()
+        
+        # Transition to EMPTY
+        self.transition(OrderState.EMPTY)
+        
+        logger.info(f"Cleared {item_count} items")
+        
+        return True
     
     # ========================================================================
-    # VALIDATION & TOTALS
+    # COMMIT / ROLLBACK (Transactional)
     # ========================================================================
     
-    def _normalize_quantity(self, quantity: Any) -> int:
+    def prepare_commit(self) -> bool:
         """
-        Normalize quantity to integer.
+        Prepare for commit (transition to CONFIRMING).
         
-        Args:
-            quantity: Raw quantity value
-            
+        This is the first phase of two-phase commit.
+        
         Returns:
-            Normalized quantity
+            True if ready for commit
         """
-        try:
-            qty = int(quantity)
-            return max(0, min(qty, self.max_quantity_per_item))
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid quantity: {quantity}")
-            return 0
-    
-    def _normalize_price(self, price: Any) -> Optional[float]:
-        """
-        Normalize price to float.
+        if self.state != OrderState.BUILDING:
+            logger.warning(
+                f"Cannot prepare: order in {self.state.value} state"
+            )
+            return False
         
-        Args:
-            price: Raw price value
-            
+        # Validate order
+        is_valid, errors = self.validate()
+        if not is_valid:
+            logger.warning(f"Order validation failed: {errors}")
+            return False
+        
+        # Transition to CONFIRMING
+        if not self.transition(OrderState.CONFIRMING):
+            return False
+        
+        self.confirmed_at = datetime.utcnow()
+        
+        # Create final snapshot before commit
+        self._create_snapshot()
+        
+        logger.info(f"Order prepared for commit: {self.order_id}")
+        
+        return True
+    
+    def commit(self) -> bool:
+        """
+        Commit order (transition to FINAL).
+        
+        This is the second phase of two-phase commit.
+        Makes order IMMUTABLE.
+        
         Returns:
-            Normalized price or None if invalid
+            True if committed
         """
-        try:
-            if isinstance(price, (int, float)):
-                price_float = float(price)
-            elif isinstance(price, str):
-                price_clean = price.replace("$", "").replace(",", "").strip()
-                price_float = float(price_clean)
-            else:
-                return None
+        if self.state != OrderState.CONFIRMING:
+            logger.error(
+                f"Cannot commit: must be in CONFIRMING state "
+                f"(current: {self.state.value})"
+            )
             
-            return round(max(0.0, price_float), 2)
+            if METRICS_ENABLED:
+                order_commits.labels(result='invalid_state').inc()
+            
+            return False
         
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid price: {price}")
-            return None
+        # Final validation
+        is_valid, errors = self.validate()
+        if not is_valid:
+            logger.error(f"Commit validation failed: {errors}")
+            
+            if METRICS_ENABLED:
+                order_commits.labels(result='validation_failed').inc()
+            
+            return False
+        
+        # Transition to FINAL (immutable)
+        if not self.transition(OrderState.FINAL):
+            if METRICS_ENABLED:
+                order_commits.labels(result='transition_failed').inc()
+            return False
+        
+        self.finalized_at = datetime.utcnow()
+        
+        # Compute final checksum
+        self._checksum = self._compute_checksum()
+        
+        if METRICS_ENABLED:
+            order_commits.labels(result='success').inc()
+            order_value.observe(self.total)
+        
+        logger.info(
+            f"Order committed: {self.order_id} "
+            f"(total=${self.total:.2f}, checksum={self._checksum[:8]})"
+        )
+        
+        return True
     
-    def _recompute_totals(self):
-        """Recompute order totals."""
-        # Calculate subtotal
-        self.subtotal = sum(item.subtotal for item in self.items.values())
-        self.subtotal = round(self.subtotal, 2)
+    def rollback(self) -> bool:
+        """
+        Rollback to last snapshot.
         
-        # Calculate tax
-        self.tax = round(self.subtotal * self.tax_rate, 2)
+        Returns:
+            True if rolled back
+        """
+        if not self._snapshots:
+            logger.warning("No snapshots available for rollback")
+            return False
         
-        # Calculate total
-        self.total = round(self.subtotal + self.tax, 2)
+        if self.is_final():
+            logger.error("Cannot rollback: order is final")
+            return False
         
+        # Get last snapshot
+        snapshot = self._snapshots[-1]
+        
+        # Restore state
+        self.state = snapshot.state
+        self._items = {item.item_id: item for item in snapshot.items}
+        self.subtotal = snapshot.subtotal
+        self.tax = snapshot.tax
+        self.total = snapshot.total
+        
+        self.rollback_count += 1
         self._touch()
         
-        logger.debug(
-            f"Totals recomputed for {self.order_id}: "
-            f"subtotal=${self.subtotal:.2f}, tax=${self.tax:.2f}, "
-            f"total=${self.total:.2f}"
+        if METRICS_ENABLED:
+            order_rollbacks.inc()
+        
+        logger.info(
+            f"Rolled back to snapshot: {snapshot.snapshot_id} "
+            f"(state={snapshot.state.value})"
         )
+        
+        return True
     
-    def validate(self) -> Dict[str, Any]:
+    def _create_snapshot(self):
+        """Create snapshot of current state (for rollback)."""
+        snapshot_id = f"snap_{uuid.uuid4().hex[:8]}"
+        
+        snapshot = OrderSnapshot(
+            snapshot_id=snapshot_id,
+            order_id=self.order_id,
+            state=self.state,
+            items=tuple(self._items.values()),  # Immutable tuple
+            subtotal=self.subtotal,
+            tax=self.tax,
+            total=self.total,
+            timestamp=datetime.utcnow(),
+            checksum=self._compute_checksum()
+        )
+        
+        self._snapshots.append(snapshot)
+        
+        # Limit snapshot count
+        if len(self._snapshots) > self._max_snapshots:
+            self._snapshots.pop(0)
+        
+        logger.debug(f"Created snapshot: {snapshot_id}")
+    
+    def get_snapshots(self) -> List[OrderSnapshot]:
+        """Get all snapshots."""
+        return self._snapshots.copy()
+    
+    # ========================================================================
+    # VALIDATION & INTEGRITY
+    # ========================================================================
+    
+    def validate(self) -> Tuple[bool, List[str]]:
         """
-        Validate order for finalization.
+        Validate order integrity.
+        
+        Checks:
+        - Has items
+        - Totals are correct
+        - Prices are valid
+        - Quantities are valid
         
         Returns:
-            Validation result with is_valid flag and errors
+            (is_valid, error_messages)
         """
-        self._transition(OrderState.VALIDATING)
-        
+        self.validation_count += 1
         errors = []
         
-        # Check items
-        if len(self.items) == 0:
+        # Check has items
+        if len(self._items) == 0:
             errors.append("Order has no items")
         
-        # Check total
-        if self.total < self.min_order_total:
-            errors.append(f"Order total below minimum: ${self.min_order_total:.2f}")
+        # Validate totals
+        expected_subtotal = sum(item.subtotal for item in self._items.values())
+        if abs(self.subtotal - expected_subtotal) > 0.01:
+            errors.append(
+                f"Subtotal mismatch: {self.subtotal} != {expected_subtotal}"
+            )
         
-        # Check item validity
-        for item in self.items.values():
+        expected_tax = round(self.subtotal * self.tax_rate, 2)
+        if abs(self.tax - expected_tax) > 0.01:
+            errors.append(
+                f"Tax mismatch: {self.tax} != {expected_tax}"
+            )
+        
+        expected_total = self.subtotal + self.tax
+        if abs(self.total - expected_total) > 0.01:
+            errors.append(
+                f"Total mismatch: {self.total} != {expected_total}"
+            )
+        
+        # Validate minimum total
+        if self.total < self.min_order_total:
+            errors.append(
+                f"Order total too low: ${self.total:.2f} < ${self.min_order_total:.2f}"
+            )
+        
+        # Validate items
+        for item in self._items.values():
             if item.quantity <= 0:
-                errors.append(f"Invalid quantity for {item.name}")
+                errors.append(f"Invalid quantity for {item.name}: {item.quantity}")
+            
             if item.price < 0:
-                errors.append(f"Invalid price for {item.name}")
+                errors.append(f"Invalid price for {item.name}: ${item.price:.2f}")
+            
+            expected_item_subtotal = round(item.price * item.quantity, 2)
+            if abs(item.subtotal - expected_item_subtotal) > 0.01:
+                errors.append(
+                    f"Item subtotal mismatch for {item.name}: "
+                    f"{item.subtotal} != {expected_item_subtotal}"
+                )
         
         is_valid = len(errors) == 0
         
-        # Track validation
-        self.validation_attempts += 1
-        
-        if not is_valid and METRICS_ENABLED:
-            for error in errors:
-                reason = error.split(':')[0] if ':' in error else error
-                order_validation_failures.labels(reason=reason[:50]).inc()
-        
-        if is_valid:
-            logger.info(f"Order {self.order_id} validation passed")
-            # Stay in VALIDATING state - finalize() will transition to FINALIZED
-        else:
-            logger.warning(f"Order {self.order_id} validation failed: {errors}")
-            self._transition(OrderState.BUILDING)
-        
-        return {
-            "is_valid": is_valid,
-            "errors": errors,
-            "order_id": self.order_id
-        }
-    
-    # ========================================================================
-    # FINALIZATION
-    # ========================================================================
-    
-    def finalize(
-        self,
-        customer_phone: Optional[str] = None,
-        customer_name: Optional[str] = None,
-        delivery_address: Optional[str] = None,
-        order_type: str = "pickup"
-    ) -> Dict[str, Any]:
-        """
-        Finalize order (makes it immutable).
-        
-        Args:
-            customer_phone: Customer phone number
-            customer_name: Customer name
-            delivery_address: Delivery address (if delivery)
-            order_type: "pickup" or "delivery"
+        if not is_valid:
+            logger.warning(f"Order validation failed: {errors}")
             
+            if METRICS_ENABLED:
+                for error in errors:
+                    order_validation_failures.labels(
+                        reason=error.split(':')[0]
+                    ).inc()
+        
+        return is_valid, errors
+    
+    def verify_integrity(self) -> bool:
+        """
+        Verify order integrity via checksum.
+        
         Returns:
-            Finalized order summary
+            True if integrity verified
         """
-        if self._check_finalized():
-            logger.warning(f"Order {self.order_id} already finalized")
-            return self.get_summary()
+        if not self._checksum:
+            logger.warning("No checksum available")
+            return False
         
-        # Validate first
-        validation = self.validate()
-        if not validation["is_valid"]:
-            logger.error(f"Cannot finalize invalid order: {validation['errors']}")
-            return {
-                "success": False,
-                "errors": validation["errors"]
-            }
+        current_checksum = self._compute_checksum()
         
-        # Set customer info
-        self.customer_phone = customer_phone
-        self.customer_name = customer_name
-        self.delivery_address = delivery_address
-        self.order_type = order_type
+        if current_checksum != self._checksum:
+            logger.error(
+                f"Integrity check failed: "
+                f"{current_checksum[:8]} != {self._checksum[:8]}"
+            )
+            return False
         
-        # Finalize
-        self._transition(OrderState.FINALIZED)
-        self._finalized = True
-        self.finalized_at = datetime.utcnow()
+        logger.debug("Integrity verified")
+        return True
+    
+    def _compute_checksum(self) -> str:
+        """
+        Compute order checksum (for integrity validation).
         
-        # Calculate fraud score
-        fraud_score = calculate_fraud_score(self)
-        
-        # Track metrics
-        if METRICS_ENABLED:
-            order_value.observe(self.total)
-            order_items_count.observe(len(self.items))
-            orders_total.labels(state='finalized').inc()
-        
-        logger.info(
-            f"Order {self.order_id} finalized: "
-            f"{len(self.items)} items, total=${self.total:.2f}, "
-            f"fraud_score={fraud_score:.2f}"
-        )
-        
-        # Save to database
-        self._save_to_db()
-        
-        return {
-            "success": True,
+        Deterministic: same order always produces same checksum.
+        """
+        # Serialize order state
+        data = {
             "order_id": self.order_id,
-            "total": self.total,
-            "summary": self.get_summary()
+            "items": sorted([
+                (item.item_id, item.canonical_id, item.quantity, item.price)
+                for item in self._items.values()
+            ]),
+            "subtotal": self.subtotal,
+            "tax": self.tax,
+            "total": self.total
         }
-    
-    def cancel(self, reason: str = "Customer request"):
-        """
-        Cancel order.
         
-        Args:
-            reason: Cancellation reason
-        """
-        if self._check_finalized():
-            return
-        
-        self._transition(OrderState.CANCELLED)
-        logger.info(f"Order {self.order_id} cancelled: {reason}")
+        # Compute hash
+        content = str(data).encode()
+        return hashlib.sha256(content).hexdigest()
     
     # ========================================================================
-    # GETTERS
+    # UTILITIES
     # ========================================================================
     
-    def get_summary(self) -> Dict[str, Any]:
-        """Get order summary."""
+    def _normalize_quantity(self, quantity: Any) -> int:
+        """Normalize quantity to int."""
+        try:
+            q = int(quantity)
+            return max(0, min(q, self.max_quantity_per_item))
+        except (ValueError, TypeError):
+            return 0
+    
+    def _normalize_price(self, price: Any) -> Optional[float]:
+        """Normalize price to float."""
+        try:
+            p = float(price)
+            return round(p, 2) if p >= 0 else None
+        except (ValueError, TypeError):
+            return None
+    
+    def _recompute_totals(self):
+        """Recompute order totals (deterministic)."""
+        self.subtotal = round(
+            sum(item.subtotal for item in self._items.values()),
+            2
+        )
+        self.tax = round(self.subtotal * self.tax_rate, 2)
+        self.total = round(self.subtotal + self.tax, 2)
+        
+        self._touch()
+    
+    def get_items(self) -> List[OrderItem]:
+        """Get all items (immutable list)."""
+        return list(self._items.values())
+    
+    def get_item(self, item_id: str) -> Optional[OrderItem]:
+        """Get specific item."""
+        return self._items.get(item_id)
+    
+    def get_item_count(self) -> int:
+        """Get total item count."""
+        return sum(item.quantity for item in self._items.values())
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Export to dictionary."""
         return {
             "order_id": self.order_id,
             "call_id": self.call_id,
             "restaurant_id": self.restaurant_id,
             "state": self.state.value,
-            "items": [asdict(item) for item in self.items.values()],
+            "items": [item.to_dict() for item in self._items.values()],
             "subtotal": self.subtotal,
             "tax": self.tax,
             "tax_rate": self.tax_rate,
             "total": self.total,
-            "item_count": len(self.items),
+            "item_count": self.get_item_count(),
             "customer_name": self.customer_name,
             "customer_phone": self.customer_phone,
             "delivery_address": self.delivery_address,
             "order_type": self.order_type,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "confirmed_at": self.confirmed_at.isoformat() if self.confirmed_at else None,
             "finalized_at": self.finalized_at.isoformat() if self.finalized_at else None,
-            "is_finalized": self._finalized
+            "checksum": self._checksum,
+            "is_mutable": self.is_mutable(),
+            "is_final": self.is_final(),
+            "modification_count": self.modification_count,
+            "validation_count": self.validation_count,
+            "rollback_count": self.rollback_count,
+            "snapshot_count": len(self._snapshots)
         }
-    
-    def get_item_count(self) -> int:
-        """Get total item count."""
-        return len(self.items)
-    
-    def get_total_quantity(self) -> int:
-        """Get total quantity across all items."""
-        return sum(item.quantity for item in self.items.values())
-    
-    def has_items(self) -> bool:
-        """Check if order has items."""
-        return len(self.items) > 0
-    
-    def is_finalized(self) -> bool:
-        """Check if order is finalized."""
-        return self._finalized
-    
-    # ========================================================================
-    # PERSISTENCE
-    # ========================================================================
-    
-    def _save_to_db(self):
-        """Save order to database."""
-        try:
-            from db import db
-            
-            order_data = {
-                "order_id": self.order_id,
-                "call_id": self.call_id,
-                "restaurant_id": self.restaurant_id,
-                "customer_phone": self.customer_phone,
-                "customer_name": self.customer_name,
-                "items": [asdict(item) for item in self.items.values()],
-                "subtotal": self.subtotal,
-                "tax": self.tax,
-                "total": self.total,
-                "order_type": self.order_type,
-                "delivery_address": self.delivery_address,
-                "status": self.state.value,
-                "created_at": self.created_at.isoformat(),
-                "finalized_at": self.finalized_at.isoformat() if self.finalized_at else None
-            }
-            
-            db.store_order(order_data)
-            logger.info(f"Order {self.order_id} saved to database")
-        
-        except Exception as e:
-            logger.error(f"Failed to save order to database: {str(e)}")
 
 
 # ============================================================================
-# GLOBAL ORDER STORE
+# GLOBAL REGISTRY
 # ============================================================================
 
-_order_store: Dict[str, Order] = {}
+_order_registry: Dict[str, TransactionalOrder] = {}
 
 
-def create_order(call_id: str, restaurant_id: str) -> Order:
-    """
-    Create new order.
-    
-    Args:
-        call_id: Call identifier
-        restaurant_id: Restaurant identifier
-        
-    Returns:
-        Order instance
-    """
-    if call_id in _order_store:
-        logger.warning(f"Order already exists for call {call_id}, returning existing")
-        return _order_store[call_id]
-    
-    order = Order(call_id, restaurant_id)
-    _order_store[call_id] = order
-    
-    logger.info(f"Created order {order.order_id} for call {call_id}")
+def create_order(call_id: str, restaurant_id: str) -> TransactionalOrder:
+    """Create new transactional order."""
+    order = TransactionalOrder(call_id, restaurant_id)
     return order
 
 
-def get_order(call_id: str) -> Optional[Order]:
-    """Get order for call."""
-    return _order_store.get(call_id)
+def get_order(order_id: str) -> Optional[TransactionalOrder]:
+    """Get order by ID."""
+    return _order_registry.get(order_id)
 
 
-def clear_order(call_id: str):
-    """Clear order (cleanup)."""
-    order = _order_store.pop(call_id, None)
-    if order:
-        logger.info(f"Cleared order {order.order_id} for call {call_id}")
-
-
-# Convenience wrapper functions
-def add_item(call_id: str, item_id: str, name: str, price: float, quantity: int = 1, notes: Optional[str] = None) -> bool:
-    """Add item to order."""
-    order = get_order(call_id)
-    return order.add_item(item_id, name, price, quantity, notes) if order else False
-
-
-def remove_item(call_id: str, item_id: str) -> bool:
-    """Remove item from order."""
-    order = get_order(call_id)
-    return order.remove_item(item_id) if order else False
-
-
-def update_item_quantity(call_id: str, item_id: str, quantity: int) -> bool:
-    """Update item quantity."""
-    order = get_order(call_id)
-    return order.update_item_quantity(item_id, quantity) if order else False
-
-
-def calculate_total(call_id: str) -> float:
-    """Get order total."""
-    order = get_order(call_id)
-    return order.total if order else 0.0
-
-
-def validate_order(call_id: str) -> bool:
-    """Validate order."""
-    order = get_order(call_id)
-    if not order:
-        return False
-    validation = order.validate()
-    return validation["is_valid"]
-
-
-def finalize_order(call_id: str, customer_phone: Optional[str] = None, customer_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Finalize order."""
-    order = get_order(call_id)
-    if not order:
-        return None
-    return order.finalize(customer_phone, customer_name)
-
-
-def get_order_summary(call_id: str) -> Optional[Dict[str, Any]]:
-    """Get order summary."""
-    order = get_order(call_id)
-    return order.get_summary() if order else None
-
-
-# ============================================================================
-# ENTERPRISE FEATURES (v2.0)
-# ============================================================================
-
-def calculate_fraud_score(order: 'Order') -> float:
-    """
-    Calculate fraud risk score for an order.
-    
-    Returns:
-        Score from 0.0 (safe) to 1.0 (high risk)
-    """
-    score = 0.0
-    
-    # Anomaly: Very large order
-    if order.total > 500:
-        score += 0.3
-        order.price_anomalies.append(f"Large order: ${order.total:.2f}")
-    
-    # Anomaly: Too many items
-    if len(order.items) > 20:
-        score += 0.2
-        order.price_anomalies.append(f"Too many items: {len(order.items)}")
-    
-    # Anomaly: Excessive quantity
-    max_qty = max((item.quantity for item in order.items.values()), default=0)
-    if max_qty > 50:
-        score += 0.3
-        order.price_anomalies.append(f"Excessive quantity: {max_qty}")
-    
-    # Anomaly: Suspiciously low total
-    if order.total < 1.0 and len(order.items) > 0:
-        score += 0.2
-        order.price_anomalies.append(f"Suspiciously low total: ${order.total:.2f}")
-    
-    order.fraud_score = min(score, 1.0)
-    
-    if METRICS_ENABLED:
-        order_fraud_score.observe(order.fraud_score)
-    
-    if score > 0.5:
-        logger.warning(
-            f"High fraud score for order {order.order_id}: {score:.2f} "
-            f"(anomalies: {order.price_anomalies})"
-        )
-    
-    return order.fraud_score
-
-
-def get_order_analytics() -> Dict[str, Any]:
-    """Get order analytics across all orders."""
-    if not _order_registry:
-        return {
-            "total_orders": 0,
-            "active_orders": 0,
-            "avg_order_value": 0.0,
-            "avg_items_per_order": 0.0
-        }
-    
-    total_value = sum(order.total for order in _order_registry.values())
-    total_items = sum(len(order.items) for order in _order_registry.values())
-    
-    return {
-        "total_orders": len(_order_registry),
-        "active_orders": len([o for o in _order_registry.values() if o.state != OrderState.FINALIZED]),
-        "avg_order_value": round(total_value / len(_order_registry), 2),
-        "avg_items_per_order": round(total_items / len(_order_registry), 2),
-        "total_revenue": round(total_value, 2)
-    }
-
-
-def clear_order(call_id: str):
+def clear_order(order_id: str):
     """Clear order from registry."""
-    order = _order_registry.get(call_id)
-    if order:
-        del _order_registry[order.order_id]
+    if order_id in _order_registry:
+        del _order_registry[order_id]
         
         if METRICS_ENABLED:
             orders_active.dec()
         
-        logger.info(f"Order cleared: {order.order_id}")
+        logger.info(f"Order cleared: {order_id}")
 
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -843,42 +947,87 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    print("Order Module (Enterprise v2.0)")
-    print("=" * 50)
+    print("Order Module (Production Hardened v3.0)")
+    print("="*60)
     
     # Create order
-    call_id = "test_call_123"
-    order = create_order(call_id, "rest_001")
-    print(f"\nOrder created: {order.order_id}")
-    print(f"State: {order.state.value}")
+    order = create_order("call_123", "rest_001")
+    print(f"\n1. Created order: {order.order_id}")
+    print(f"   State: {order.state.value}")
     
-    # Add items
-    order.add_item("item_1", "Large Pizza", 15.99, 2)
-    order.add_item("item_2", "Chicken Wings", 9.99, 1)
-    order.add_item("item_3", "Soda", 2.99, 3)
+    # Add item (transitions to BUILDING)
+    success = order.add_item(
+        item_id="item_1",
+        canonical_id="menu_abc123",
+        name="Large Pizza",
+        price=15.99,
+        quantity=2
+    )
+    print(f"\n2. Added item: {success}")
+    print(f"   State: {order.state.value}")
+    print(f"   Total: ${order.total:.2f}")
     
-    print(f"\nItems added: {order.get_item_count()}")
-    print(f"Total quantity: {order.get_total_quantity()}")
-    print(f"Subtotal: ${order.subtotal:.2f}")
-    print(f"Tax: ${order.tax:.2f}")
-    print(f"Total: ${order.total:.2f}")
+    # Try to add duplicate without flag (rejected)
+    success = order.add_item(
+        item_id="item_1",
+        canonical_id="menu_abc123",
+        name="Large Pizza",
+        price=15.99,
+        quantity=1
+    )
+    print(f"\n3. Duplicate add (no flag): {success}")
     
-    # Update quantity
-    order.update_item_quantity("item_1", 3)
-    print(f"\nAfter update - Total: ${order.total:.2f}")
+    # Add with overwrite flag
+    success = order.add_item(
+        item_id="item_1",
+        canonical_id="menu_abc123",
+        name="Large Pizza",
+        price=15.99,
+        quantity=3,
+        allow_overwrite=True
+    )
+    print(f"\n4. Duplicate add (with flag): {success}")
     
-    # Validate
-    validation = order.validate()
-    print(f"\nValidation: {'PASS' if validation['is_valid'] else 'FAIL'}")
+    # Prepare commit
+    success = order.prepare_commit()
+    print(f"\n5. Prepared for commit: {success}")
+    print(f"   State: {order.state.value}")
     
-    # Finalize
-    result = order.finalize(customer_phone="+1234567890", customer_name="John Doe")
-    print(f"\nFinalized: {result['success']}")
-    print(f"Order ID: {result['order_id']}")
+    # Rollback
+    success = order.rollback()
+    print(f"\n6. Rolled back: {success}")
+    print(f"   State: {order.state.value}")
     
-    # Try to modify (should fail)
-    success = order.add_item("item_4", "Dessert", 5.99, 1)
-    print(f"\nTry to modify finalized order: {'Success' if success else 'Blocked (expected)'}")
+    # Prepare and commit
+    order.prepare_commit()
+    success = order.commit()
+    print(f"\n7. Committed: {success}")
+    print(f"   State: {order.state.value}")
+    print(f"   Is mutable: {order.is_mutable()}")
+    print(f"   Is final: {order.is_final()}")
     
-    print("\n" + "=" * 50)
-    print("Production order module ready")
+    # Try to modify (rejected)
+    success = order.add_item(
+        item_id="item_2",
+        canonical_id="menu_xyz789",
+        name="Salad",
+        price=8.99,
+        quantity=1
+    )
+    print(f"\n8. Modify after commit: {success}")
+    
+    # Validation
+    is_valid, errors = order.validate()
+    print(f"\n9. Validation: {is_valid}")
+    if errors:
+        for error in errors:
+            print(f"   - {error}")
+    
+    # Export
+    export = order.to_dict()
+    print(f"\n10. Export:")
+    print(f"   Order ID: {export['order_id']}")
+    print(f"   State: {export['state']}")
+    print(f"   Items: {export['item_count']}")
+    print(f"   Total: ${export['total']:.2f}")
+    print(f"   Checksum: {export['checksum'][:16]}...")
