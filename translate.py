@@ -1,22 +1,19 @@
 """
-Translation Module (Enterprise Production)
-===========================================
-Enterprise-grade translation service with Google Cloud and fallback.
+Translation Module (Production Hardened)
+=========================================
+Isolated translation that cannot destabilize calls.
 
-NEW FEATURES (Enterprise v2.0):
-✅ Multi-provider fallback (Google → DeepL → LibreTranslate)
-✅ Translation quality scoring
-✅ Cost tracking per translation
-✅ LRU cache with TTL (3600s)
-✅ Batch translation support
-✅ Language pair confidence tracking
-✅ Prometheus metrics integration
-✅ Translation latency monitoring
-✅ Character count tracking
-✅ Error recovery and retry logic
+HARDENING UPDATES (v3.0):
+✅ All translation is optional (can be disabled per call)
+✅ Strict timeouts with guaranteed completion
+✅ Bypass logic if translation fails
+✅ Caching for repeated phrases
+✅ Translation never blocks call loop
+✅ NO fatal exceptions raised
+✅ Graceful degradation
 
-Version: 2.0.0 (Enterprise)
-Last Updated: 2026-01-21
+Version: 3.0.0 (Production Hardened)
+Last Updated: 2026-01-22
 """
 
 import os
@@ -24,6 +21,8 @@ import asyncio
 import logging
 from typing import Dict, Optional, Any, List
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import time
 from collections import defaultdict
@@ -46,26 +45,38 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# Configuration
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 SUPPORTED_LANGUAGES = os.getenv("SUPPORTED_LANGUAGES", "en,ar,es").split(",")
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "en")
-TRANSLATION_TIMEOUT = float(os.getenv("TRANSLATION_TIMEOUT", "3.0"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES_TRANSLATION", "2"))
+
+# Timeout configuration (STRICT)
+TRANSLATION_TIMEOUT = float(os.getenv("TRANSLATION_TIMEOUT", "2.0"))  # 2s max
+CACHE_LOOKUP_TIMEOUT = float(os.getenv("CACHE_LOOKUP_TIMEOUT", "0.1"))  # 100ms max
+
+# Cache configuration
 CACHE_TTL_SECONDS = int(os.getenv("TRANSLATION_CACHE_TTL", "3600"))
-CACHE_MAX_SIZE = int(os.getenv("TRANSLATION_CACHE_SIZE", "500"))
-MAX_CONCURRENT_TRANSLATIONS = int(os.getenv("MAX_CONCURRENT_TRANSLATIONS", "20"))
+CACHE_MAX_SIZE = int(os.getenv("TRANSLATION_CACHE_SIZE", "1000"))
 
+# Optional translation (can be disabled globally or per-call)
+TRANSLATION_ENABLED = os.getenv("TRANSLATION_ENABLED", "true").lower() == "true"
+BYPASS_ON_FAILURE = os.getenv("TRANSLATION_BYPASS_ON_FAILURE", "true").lower() == "true"
 
-# Cost per 1M characters (Google Cloud Translation API)
+# Cost tracking
 COST_PER_MILLION_CHARS = 20.0  # $20 per 1M characters
 
 
-# Prometheus Metrics
+# ============================================================================
+# METRICS
+# ============================================================================
+
 if METRICS_ENABLED:
     translation_requests_total = Counter(
         'translation_requests_total',
         'Total translation requests',
-        ['source_lang', 'target_lang', 'provider', 'result']
+        ['source_lang', 'target_lang', 'result']
     )
     translation_cache_hits = Counter(
         'translation_cache_hits_total',
@@ -77,35 +88,91 @@ if METRICS_ENABLED:
     )
     translation_duration = Histogram(
         'translation_duration_seconds',
-        'Translation duration',
-        ['provider']
+        'Translation duration'
     )
-    translation_characters = Counter(
-        'translation_characters_total',
-        'Total characters translated',
-        ['source_lang', 'target_lang']
+    translation_timeouts = Counter(
+        'translation_timeouts_total',
+        'Translation timeout events'
+    )
+    translation_bypasses = Counter(
+        'translation_bypasses_total',
+        'Translation bypass events',
+        ['reason']
+    )
+    translation_errors = Counter(
+        'translation_errors_total',
+        'Translation errors (non-fatal)',
+        ['error_type']
     )
     translation_cost = Counter(
         'translation_cost_dollars',
         'Estimated translation cost'
     )
-    translation_quality_score = Histogram(
-        'translation_quality_score',
-        'Translation quality scores'
-    )
-    translation_errors = Counter(
-        'translation_errors_total',
-        'Translation errors',
-        ['error_type', 'provider']
-    )
-    translation_active = Gauge(
-        'translation_active_requests',
-        'Currently active translations'
-    )
 
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class TranslationResult(Enum):
+    """Translation operation result."""
+    SUCCESS = "success"
+    CACHED = "cached"
+    BYPASSED = "bypassed"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    DISABLED = "disabled"
+
+
+class BypassReason(Enum):
+    """Reason for bypassing translation."""
+    DISABLED_GLOBALLY = "disabled_globally"
+    DISABLED_PER_CALL = "disabled_per_call"
+    SAME_LANGUAGE = "same_language"
+    EMPTY_TEXT = "empty_text"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    LIBRARY_UNAVAILABLE = "library_unavailable"
+
+
+# ============================================================================
+# TRANSLATION RESPONSE
+# ============================================================================
+
+@dataclass
+class TranslationResponse:
+    """
+    Translation response (never raises exceptions).
+    
+    Always returns a response - either translated text or original.
+    """
+    text: str
+    result: TranslationResult
+    bypass_reason: Optional[BypassReason] = None
+    cached: bool = False
+    duration_ms: float = 0.0
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary."""
+        response = {
+            "text": self.text,
+            "result": self.result.value,
+            "cached": self.cached,
+            "duration_ms": round(self.duration_ms, 2)
+        }
+        
+        if self.bypass_reason:
+            response["bypass_reason"] = self.bypass_reason.value
+        
+        return response
+
+
+# ============================================================================
+# PHRASE CACHE
+# ============================================================================
 
 class TranslationCacheEntry:
-    """Cache entry with quality score and TTL."""
+    """Cache entry with TTL."""
     
     def __init__(self, translated_text: str, source_lang: str, target_lang: str):
         self.translated_text = translated_text
@@ -114,7 +181,6 @@ class TranslationCacheEntry:
         self.created_at = datetime.utcnow()
         self.access_count = 0
         self.last_accessed = datetime.utcnow()
-        self.quality_score = 0.0
     
     def is_expired(self) -> bool:
         """Check if entry is expired."""
@@ -127,78 +193,140 @@ class TranslationCacheEntry:
         self.last_accessed = datetime.utcnow()
 
 
-class TranslationCache:
-    """LRU cache with TTL for translations."""
+class PhraseCache:
+    """
+    LRU cache for repeated phrases with timeout protection.
+    
+    Lookups are guaranteed to complete within CACHE_LOOKUP_TIMEOUT.
+    """
     
     def __init__(self, max_size: int = CACHE_MAX_SIZE):
         self.max_size = max_size
         self.cache: Dict[str, TranslationCacheEntry] = {}
         self.access_order = []
+        self._lock = asyncio.Lock()
         
         # Stats
         self.hits = 0
         self.misses = 0
         self.evictions = 0
-        self.expired_evictions = 0
+        self.timeouts = 0
     
     def _generate_key(self, text: str, source_lang: str, target_lang: str) -> str:
         """Generate cache key."""
         content = f"{text}:{source_lang}:{target_lang}"
         return hashlib.md5(content.encode()).hexdigest()
     
-    def get(self, text: str, source_lang: str, target_lang: str) -> Optional[str]:
-        """Get cached translation."""
-        key = self._generate_key(text, source_lang, target_lang)
-        entry = self.cache.get(key)
+    async def get(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str
+    ) -> Optional[str]:
+        """
+        Get cached translation with timeout.
         
-        if entry:
-            if entry.is_expired():
-                del self.cache[key]
+        Guaranteed to return within CACHE_LOOKUP_TIMEOUT or None.
+        """
+        try:
+            # Timeout protection
+            result = await asyncio.wait_for(
+                self._get_impl(text, source_lang, target_lang),
+                timeout=CACHE_LOOKUP_TIMEOUT
+            )
+            return result
+        
+        except asyncio.TimeoutError:
+            self.timeouts += 1
+            logger.warning(
+                f"Cache lookup timeout: {len(text)} chars "
+                f"(took > {CACHE_LOOKUP_TIMEOUT}s)"
+            )
+            return None
+    
+    async def _get_impl(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str
+    ) -> Optional[str]:
+        """Internal get implementation."""
+        key = self._generate_key(text, source_lang, target_lang)
+        
+        async with self._lock:
+            entry = self.cache.get(key)
+            
+            if entry:
+                if entry.is_expired():
+                    del self.cache[key]
+                    self.access_order.remove(key)
+                    self.evictions += 1
+                    self.misses += 1
+                    
+                    if METRICS_ENABLED:
+                        translation_cache_misses.inc()
+                    
+                    return None
+                
+                # Cache hit
+                entry.access()
+                self.hits += 1
+                
+                # Update LRU
                 self.access_order.remove(key)
-                self.expired_evictions += 1
-                self.misses += 1
+                self.access_order.append(key)
                 
                 if METRICS_ENABLED:
-                    translation_cache_misses.inc()
+                    translation_cache_hits.inc()
                 
-                return None
+                return entry.translated_text
             
-            # Cache hit
-            entry.access()
-            self.hits += 1
-            
-            # Update LRU
-            self.access_order.remove(key)
-            self.access_order.append(key)
-            
+            # Cache miss
+            self.misses += 1
             if METRICS_ENABLED:
-                translation_cache_hits.inc()
+                translation_cache_misses.inc()
             
-            return entry.translated_text
-        
-        # Cache miss
-        self.misses += 1
-        if METRICS_ENABLED:
-            translation_cache_misses.inc()
-        
-        return None
+            return None
     
-    def put(self, text: str, source_lang: str, target_lang: str, translation: str):
-        """Put translation in cache."""
+    async def put(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        translation: str
+    ):
+        """Put translation in cache (non-blocking)."""
+        try:
+            await asyncio.wait_for(
+                self._put_impl(text, source_lang, target_lang, translation),
+                timeout=CACHE_LOOKUP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Cache put timeout - skipping")
+    
+    async def _put_impl(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        translation: str
+    ):
+        """Internal put implementation."""
         key = self._generate_key(text, source_lang, target_lang)
         
-        # Evict if at capacity
-        if len(self.cache) >= self.max_size and key not in self.cache:
-            self._evict_lru()
-        
-        # Store entry
-        entry = TranslationCacheEntry(translation, source_lang, target_lang)
-        self.cache[key] = entry
-        
-        # Update LRU
-        if key in self.access_order:
-            self.access_order.remove(key)
-        self.access_order.append(key)
+        async with self._lock:
+            # Evict if at capacity
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                self._evict_lru()
+            
+            # Store entry
+            entry = TranslationCacheEntry(translation, source_lang, target_lang)
+            self.cache[key] = entry
+            
+            # Update LRU
+            if key in self.access_order:
+                self.access_order.remove(key)
+            self.access_order.append(key)
     
     def _evict_lru(self):
         """Evict least recently used."""
@@ -221,7 +349,7 @@ class TranslationCache:
             "misses": self.misses,
             "hit_rate": round(hit_rate, 4),
             "evictions": self.evictions,
-            "expired_evictions": self.expired_evictions
+            "timeouts": self.timeouts
         }
     
     def clear(self):
@@ -230,36 +358,185 @@ class TranslationCache:
         self.access_order.clear()
 
 
-class TranslationController:
-    """Controls translation with provider fallback."""
+# ============================================================================
+# TRANSLATION ENGINE (Isolated)
+# ============================================================================
+
+class IsolatedTranslationEngine:
+    """
+    Isolated translation engine that never blocks call loop.
+    
+    Guarantees:
+    - Always returns within timeout
+    - Never raises fatal exceptions
+    - Gracefully degrades on failure
+    """
     
     def __init__(self):
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
         self.translation_count = 0
         self.total_characters = 0
+        self.timeout_count = 0
         self.error_count = 0
-        self.fallback_count = 0
-        self.provider_stats = defaultdict(int)
-        self.language_pair_stats = defaultdict(int)
+        self.bypass_count = 0
         self.start_time = datetime.utcnow()
     
     async def translate(
         self,
         text: str,
         source_lang: str,
-        target_lang: str
-    ) -> Optional[str]:
-        """Translate with concurrency control and fallback."""
-        async with self.semaphore:
-            if METRICS_ENABLED:
-                translation_active.inc()
+        target_lang: str,
+        enabled: bool = True
+    ) -> TranslationResponse:
+        """
+        Translate text with isolation guarantees.
+        
+        NEVER RAISES EXCEPTIONS - always returns TranslationResponse.
+        
+        Args:
+            text: Text to translate
+            source_lang: Source language
+            target_lang: Target language
+            enabled: Whether translation is enabled for this call
             
-            try:
-                result = await self._do_translate(text, source_lang, target_lang)
-                return result
-            finally:
+        Returns:
+            TranslationResponse (never None)
+        """
+        start_time = time.time()
+        
+        # Pre-flight checks (bypass conditions)
+        bypass = self._check_bypass(text, source_lang, target_lang, enabled)
+        if bypass:
+            return bypass
+        
+        # Attempt translation with strict timeout
+        try:
+            result = await asyncio.wait_for(
+                self._do_translate(text, source_lang, target_lang),
+                timeout=TRANSLATION_TIMEOUT
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            
+            if result:
+                self.translation_count += 1
+                self.total_characters += len(text)
+                
+                # Track cost
                 if METRICS_ENABLED:
-                    translation_active.dec()
+                    cost = (len(text) / 1_000_000) * COST_PER_MILLION_CHARS
+                    translation_cost.inc(cost)
+                
+                return TranslationResponse(
+                    text=result,
+                    result=TranslationResult.SUCCESS,
+                    duration_ms=duration_ms
+                )
+            else:
+                # Translation failed - bypass
+                return self._bypass(
+                    text,
+                    BypassReason.ERROR,
+                    duration_ms
+                )
+        
+        except asyncio.TimeoutError:
+            self.timeout_count += 1
+            duration_ms = (time.time() - start_time) * 1000
+            
+            logger.warning(
+                f"Translation timeout: {len(text)} chars "
+                f"({duration_ms:.0f}ms > {TRANSLATION_TIMEOUT*1000}ms)"
+            )
+            
+            if METRICS_ENABLED:
+                translation_timeouts.inc()
+            
+            return self._bypass(
+                text,
+                BypassReason.TIMEOUT,
+                duration_ms
+            )
+        
+        except Exception as e:
+            # CRITICAL: Catch ALL exceptions (never propagate)
+            self.error_count += 1
+            duration_ms = (time.time() - start_time) * 1000
+            
+            logger.error(
+                f"Translation error (non-fatal): {type(e).__name__} - {str(e)}"
+            )
+            
+            if METRICS_ENABLED:
+                translation_errors.labels(error_type=type(e).__name__).inc()
+            
+            return self._bypass(
+                text,
+                BypassReason.ERROR,
+                duration_ms
+            )
+    
+    def _check_bypass(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        enabled: bool
+    ) -> Optional[TranslationResponse]:
+        """
+        Check if translation should be bypassed.
+        
+        Returns TranslationResponse if bypassed, None otherwise.
+        """
+        # Check if globally disabled
+        if not TRANSLATION_ENABLED:
+            return self._bypass(text, BypassReason.DISABLED_GLOBALLY)
+        
+        # Check if disabled for this call
+        if not enabled:
+            return self._bypass(text, BypassReason.DISABLED_PER_CALL)
+        
+        # Check empty text
+        if not text or not text.strip():
+            return self._bypass(text, BypassReason.EMPTY_TEXT)
+        
+        # Check same language
+        if source_lang == target_lang:
+            return self._bypass(text, BypassReason.SAME_LANGUAGE)
+        
+        # Check library availability
+        if not GOOGLE_AVAILABLE:
+            logger.warning("Translation library not available - bypassing")
+            return self._bypass(text, BypassReason.LIBRARY_UNAVAILABLE)
+        
+        return None  # No bypass
+    
+    def _bypass(
+        self,
+        original_text: str,
+        reason: BypassReason,
+        duration_ms: float = 0.0
+    ) -> TranslationResponse:
+        """
+        Bypass translation and return original text.
+        
+        This is the SAFE fallback path.
+        """
+        self.bypass_count += 1
+        
+        if METRICS_ENABLED:
+            translation_bypasses.labels(reason=reason.value).inc()
+            translation_requests_total.labels(
+                source_lang='unknown',
+                target_lang='unknown',
+                result='bypassed'
+            ).inc()
+        
+        return TranslationResponse(
+            text=original_text,
+            result=TranslationResult.BYPASSED,
+            bypass_reason=reason,
+            duration_ms=duration_ms
+        )
     
     async def _do_translate(
         self,
@@ -267,282 +544,279 @@ class TranslationController:
         source_lang: str,
         target_lang: str
     ) -> Optional[str]:
-        """Perform translation with provider fallback."""
-        start_time = time.time()
+        """
+        Perform actual translation (isolated).
         
-        self.translation_count += 1
-        self.total_characters += len(text)
-        
-        # Track language pair
-        pair_key = f"{source_lang}->{target_lang}"
-        self.language_pair_stats[pair_key] += 1
-        
-        # Try primary provider (Google)
-        providers = [
-            ("google", self._translate_google),
-            # Add more providers here in future
-            # ("deepl", self._translate_deepl),
-            # ("libre", self._translate_libre),
-        ]
-        
-        last_error = None
-        
-        for provider_name, provider_func in providers:
-            try:
-                translation = await provider_func(text, source_lang, target_lang)
-                
-                if translation:
-                    duration = time.time() - start_time
-                    
-                    # Track success
-                    self.provider_stats[provider_name] += 1
-                    
-                    if METRICS_ENABLED:
-                        translation_requests_total.labels(
-                            source_lang=source_lang,
-                            target_lang=target_lang,
-                            provider=provider_name,
-                            result='success'
-                        ).inc()
-                        translation_duration.labels(provider=provider_name).observe(duration)
-                        translation_characters.labels(
-                            source_lang=source_lang,
-                            target_lang=target_lang
-                        ).inc(len(text))
-                        
-                        # Track cost
-                        cost = (len(text) / 1_000_000) * COST_PER_MILLION_CHARS
-                        translation_cost.inc(cost)
-                    
-                    logger.debug(
-                        f"Translation: {source_lang}->{target_lang} "
-                        f"({len(text)} chars, {duration:.3f}s, {provider_name})"
-                    )
-                    
-                    return translation
-            
-            except Exception as e:
-                last_error = e
-                self.error_count += 1
-                
-                if METRICS_ENABLED:
-                    translation_errors.labels(
-                        error_type=type(e).__name__,
-                        provider=provider_name
-                    ).inc()
-                
-                logger.warning(f"Provider {provider_name} failed: {str(e)}")
-                
-                # Try next provider
-                if provider_name != providers[-1][0]:
-                    self.fallback_count += 1
-                    logger.info(f"Falling back to next provider...")
-                    continue
-        
-        # All providers failed
-        if METRICS_ENABLED:
-            translation_requests_total.labels(
-                source_lang=source_lang,
-                target_lang=target_lang,
-                provider='all',
-                result='error'
-            ).inc()
-        
-        logger.error(f"All translation providers failed: {last_error}")
-        return None
-    
-    async def _translate_google(
-        self,
-        text: str,
-        source_lang: str,
-        target_lang: str
-    ) -> Optional[str]:
-        """Translate using Google Cloud."""
-        if not GOOGLE_AVAILABLE:
-            raise RuntimeError("Google Cloud Translation not available")
-        
-        client = translate.Client()
-        
-        # Run in executor (sync API)
-        loop = asyncio.get_event_loop()
-        
+        Returns None on failure (never raises).
+        """
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: client.translate(
-                        text,
-                        source_language=source_lang,
-                        target_language=target_lang
-                    )
-                ),
-                timeout=TRANSLATION_TIMEOUT
+            client = translate.Client()
+            
+            # Run in executor (sync API)
+            loop = asyncio.get_event_loop()
+            
+            result = await loop.run_in_executor(
+                None,
+                lambda: client.translate(
+                    text,
+                    source_language=source_lang,
+                    target_language=target_lang
+                )
             )
             
-            return result.get("translatedText")
+            translated = result.get("translatedText")
+            
+            if METRICS_ENABLED:
+                translation_requests_total.labels(
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    result='success'
+                ).inc()
+            
+            return translated
         
-        except asyncio.TimeoutError:
-            raise RuntimeError("Translation timeout")
         except GoogleAPIError as e:
-            raise RuntimeError(f"Google API error: {str(e)}")
-    
-    def estimate_cost(self) -> float:
-        """Estimate total translation cost."""
-        return (self.total_characters / 1_000_000) * COST_PER_MILLION_CHARS
+            logger.error(f"Google API error (non-fatal): {str(e)}")
+            return None
+        
+        except Exception as e:
+            logger.error(f"Translation error (non-fatal): {str(e)}")
+            return None
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get translation statistics."""
+        """Get engine statistics."""
         uptime = (datetime.utcnow() - self.start_time).total_seconds()
         avg_chars = self.total_characters / max(1, self.translation_count)
+        cost = (self.total_characters / 1_000_000) * COST_PER_MILLION_CHARS
         
         return {
             "translation_count": self.translation_count,
             "total_characters": self.total_characters,
-            "avg_chars_per_translation": round(avg_chars, 1),
+            "avg_chars": round(avg_chars, 1),
+            "timeouts": self.timeout_count,
             "errors": self.error_count,
-            "fallbacks": self.fallback_count,
-            "estimated_cost_usd": round(self.estimate_cost(), 4),
-            "provider_usage": dict(self.provider_stats),
-            "language_pairs": dict(self.language_pair_stats),
+            "bypasses": self.bypass_count,
+            "estimated_cost_usd": round(cost, 4),
             "uptime_seconds": round(uptime, 2)
         }
 
 
-# Global instances
-_cache = TranslationCache()
-_controller = TranslationController()
+# ============================================================================
+# GLOBAL INSTANCES
+# ============================================================================
+
+_cache = PhraseCache()
+_engine = IsolatedTranslationEngine()
 
 
-async def to_english(text: str, source_lang: str) -> str:
+# ============================================================================
+# PUBLIC API (Safe, Non-Blocking)
+# ============================================================================
+
+async def to_english(
+    text: str,
+    source_lang: str,
+    enabled: bool = True
+) -> TranslationResponse:
     """
-    Translate text to English.
+    Translate text to English (optional, non-blocking).
+    
+    GUARANTEES:
+    - Always returns within timeout
+    - Never raises exceptions
+    - Returns original text on failure
     
     Args:
         text: Text to translate
         source_lang: Source language code
+        enabled: Whether translation is enabled (default True)
         
     Returns:
-        Translated text (or original if already English or error)
+        TranslationResponse with translated or original text
     """
-    if not text or not text.strip():
-        return text
+    start_time = time.time()
     
-    # Already English
+    # Check if already English
     if source_lang == "en":
-        return text
+        return TranslationResponse(
+            text=text,
+            result=TranslationResult.BYPASSED,
+            bypass_reason=BypassReason.SAME_LANGUAGE
+        )
     
-    # Check cache
-    cached = _cache.get(text, source_lang, "en")
+    # Check cache first
+    cached = await _cache.get(text, source_lang, "en")
     if cached:
-        return cached
+        duration_ms = (time.time() - start_time) * 1000
+        return TranslationResponse(
+            text=cached,
+            result=TranslationResult.CACHED,
+            cached=True,
+            duration_ms=duration_ms
+        )
     
-    # Translate
-    translation = await _controller.translate(text, source_lang, "en")
+    # Translate (isolated, non-blocking)
+    response = await _engine.translate(text, source_lang, "en", enabled)
     
-    if translation:
-        # Cache result
-        _cache.put(text, source_lang, "en", translation)
-        return translation
+    # Cache successful translations
+    if response.result == TranslationResult.SUCCESS:
+        await _cache.put(text, source_lang, "en", response.text)
     
-    # Fallback to original
-    logger.warning(f"Translation failed, using original text")
-    return text
+    return response
 
 
-async def from_english(text: str, target_lang: str) -> str:
+async def from_english(
+    text: str,
+    target_lang: str,
+    enabled: bool = True
+) -> TranslationResponse:
     """
-    Translate text from English.
+    Translate text from English (optional, non-blocking).
+    
+    GUARANTEES:
+    - Always returns within timeout
+    - Never raises exceptions
+    - Returns original text on failure
     
     Args:
         text: English text
         target_lang: Target language code
+        enabled: Whether translation is enabled (default True)
         
     Returns:
-        Translated text (or original if already target language or error)
+        TranslationResponse with translated or original text
     """
-    if not text or not text.strip():
-        return text
+    start_time = time.time()
     
-    # Already target language
+    # Check if already target language
     if target_lang == "en":
-        return text
+        return TranslationResponse(
+            text=text,
+            result=TranslationResult.BYPASSED,
+            bypass_reason=BypassReason.SAME_LANGUAGE
+        )
     
-    # Check cache
-    cached = _cache.get(text, "en", target_lang)
+    # Check cache first
+    cached = await _cache.get(text, "en", target_lang)
     if cached:
-        return cached
+        duration_ms = (time.time() - start_time) * 1000
+        return TranslationResponse(
+            text=cached,
+            result=TranslationResult.CACHED,
+            cached=True,
+            duration_ms=duration_ms
+        )
     
-    # Translate
-    translation = await _controller.translate(text, "en", target_lang)
+    # Translate (isolated, non-blocking)
+    response = await _engine.translate(text, "en", target_lang, enabled)
     
-    if translation:
-        # Cache result
-        _cache.put(text, "en", target_lang, translation)
-        return translation
+    # Cache successful translations
+    if response.result == TranslationResult.SUCCESS:
+        await _cache.put(text, "en", target_lang, response.text)
     
-    # Fallback to original
-    logger.warning(f"Translation failed, using original text")
-    return text
+    return response
 
 
 async def translate_text(
     text: str,
     source_lang: str,
-    target_lang: str
-) -> Optional[str]:
+    target_lang: str,
+    enabled: bool = True
+) -> TranslationResponse:
     """
-    Translate text between any supported languages.
+    Translate text between any languages (optional, non-blocking).
+    
+    GUARANTEES:
+    - Always returns within timeout
+    - Never raises exceptions
+    - Returns original text on failure
     
     Args:
         text: Text to translate
-        source_lang: Source language code
-        target_lang: Target language code
+        source_lang: Source language
+        target_lang: Target language
+        enabled: Whether translation is enabled (default True)
         
     Returns:
-        Translated text or None
+        TranslationResponse with translated or original text
     """
-    if not text or not text.strip():
-        return text
+    start_time = time.time()
     
+    # Check if same language
     if source_lang == target_lang:
-        return text
+        return TranslationResponse(
+            text=text,
+            result=TranslationResult.BYPASSED,
+            bypass_reason=BypassReason.SAME_LANGUAGE
+        )
     
-    # Check cache
-    cached = _cache.get(text, source_lang, target_lang)
+    # Check cache first
+    cached = await _cache.get(text, source_lang, target_lang)
     if cached:
-        return cached
+        duration_ms = (time.time() - start_time) * 1000
+        return TranslationResponse(
+            text=cached,
+            result=TranslationResult.CACHED,
+            cached=True,
+            duration_ms=duration_ms
+        )
     
-    # Translate
-    translation = await _controller.translate(text, source_lang, target_lang)
+    # Translate (isolated, non-blocking)
+    response = await _engine.translate(text, source_lang, target_lang, enabled)
     
-    if translation:
-        _cache.put(text, source_lang, target_lang, translation)
+    # Cache successful translations
+    if response.result == TranslationResult.SUCCESS:
+        await _cache.put(text, source_lang, target_lang, response.text)
     
-    return translation
+    return response
 
 
 async def batch_translate(
     texts: List[str],
     source_lang: str,
-    target_lang: str
-) -> List[Optional[str]]:
+    target_lang: str,
+    enabled: bool = True
+) -> List[TranslationResponse]:
     """
-    Translate multiple texts concurrently.
+    Translate multiple texts concurrently (optional, non-blocking).
+    
+    GUARANTEES:
+    - Each translation isolated
+    - Never blocks on failures
+    - Returns all results (some may be bypassed)
     
     Args:
         texts: List of texts to translate
         source_lang: Source language
         target_lang: Target language
+        enabled: Whether translation is enabled (default True)
         
     Returns:
-        List of translations
+        List of TranslationResponse
     """
     tasks = [
-        translate_text(text, source_lang, target_lang)
+        translate_text(text, source_lang, target_lang, enabled)
         for text in texts
     ]
     
     return await asyncio.gather(*tasks)
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def is_translation_enabled() -> bool:
+    """Check if translation is globally enabled."""
+    return TRANSLATION_ENABLED
+
+
+def get_timeout_config() -> Dict[str, float]:
+    """Get timeout configuration."""
+    return {
+        "translation_timeout_seconds": TRANSLATION_TIMEOUT,
+        "cache_lookup_timeout_seconds": CACHE_LOOKUP_TIMEOUT
+    }
 
 
 def get_cache_stats() -> Dict[str, Any]:
@@ -552,7 +826,7 @@ def get_cache_stats() -> Dict[str, Any]:
 
 def get_translation_stats() -> Dict[str, Any]:
     """Get translation statistics."""
-    return _controller.get_stats()
+    return _engine.get_stats()
 
 
 def clear_cache():
@@ -570,6 +844,10 @@ def get_supported_languages() -> List[str]:
     return SUPPORTED_LANGUAGES.copy()
 
 
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -577,20 +855,54 @@ if __name__ == "__main__":
     )
     
     async def example():
-        print("Translation Module (Enterprise v2.0)")
-        print("="*50)
+        print("Translation Module (Production Hardened v3.0)")
+        print("="*60)
+        print(f"Translation Enabled: {TRANSLATION_ENABLED}")
+        print(f"Translation Timeout: {TRANSLATION_TIMEOUT}s")
+        print(f"Bypass on Failure: {BYPASS_ON_FAILURE}")
+        print("="*60)
         
-        # Translate to English
-        text_ar = "مرحبا بك"
-        text_en = await to_english(text_ar, "ar")
-        print(f"\nArabic -> English: '{text_ar}' -> '{text_en}'")
+        # Test 1: Translation to English
+        print("\n1. Translation to English:")
+        response = await to_english("مرحبا بك", "ar", enabled=True)
+        print(f"  Text: {response.text}")
+        print(f"  Result: {response.result.value}")
+        print(f"  Cached: {response.cached}")
+        print(f"  Duration: {response.duration_ms:.1f}ms")
         
-        # Translate from English
-        text_es = await from_english("Hello", "es")
-        print(f"English -> Spanish: 'Hello' -> '{text_es}'")
+        # Test 2: Translation from English
+        print("\n2. Translation from English:")
+        response = await from_english("Hello", "es", enabled=True)
+        print(f"  Text: {response.text}")
+        print(f"  Result: {response.result.value}")
+        
+        # Test 3: Disabled translation (bypass)
+        print("\n3. Disabled translation:")
+        response = await to_english("Hello", "en", enabled=False)
+        print(f"  Text: {response.text}")
+        print(f"  Result: {response.result.value}")
+        print(f"  Bypass Reason: {response.bypass_reason.value if response.bypass_reason else 'N/A'}")
+        
+        # Test 4: Batch translation
+        print("\n4. Batch translation:")
+        responses = await batch_translate(
+            ["Hello", "Goodbye", "Thank you"],
+            "en",
+            "es",
+            enabled=True
+        )
+        for i, resp in enumerate(responses):
+            print(f"  [{i+1}] {resp.text} (result={resp.result.value})")
         
         # Stats
-        print(f"\nCache stats: {get_cache_stats()}")
-        print(f"\nTranslation stats: {get_translation_stats()}")
+        print("\n5. Cache statistics:")
+        cache_stats = get_cache_stats()
+        for key, value in cache_stats.items():
+            print(f"  {key}: {value}")
+        
+        print("\n6. Translation statistics:")
+        trans_stats = get_translation_stats()
+        for key, value in trans_stats.items():
+            print(f"  {key}: {value}")
     
     asyncio.run(example())
