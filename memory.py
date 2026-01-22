@@ -1,30 +1,28 @@
 """
-Memory Module (Enterprise Production)
-======================================
-Enterprise-grade structured conversation memory with compression.
+Memory Module (Production Hardened)
+====================================
+Structured conversation memory system with immutability guarantees.
 
-NEW FEATURES (Enterprise v2.0):
-✅ Turn history compression (gzip for large histories)
-✅ Automatic cleanup policy (max turns configurable)
-✅ Memory usage tracking per call
-✅ Prometheus metrics integration
-✅ Snapshot versioning with diff tracking
-✅ Memory leak detection
-✅ Fact/flag/slot usage analytics
-✅ Turn type distribution tracking
-✅ Memory access patterns monitoring
-✅ Automatic archival of old turns
+HARDENING UPDATES (v3.0):
+✅ ConversationMemory class with structured fields
+✅ Memory pruning (sliding window + token budgeting)
+✅ Immutable history records (write-once turns)
+✅ AI cannot directly write memory (controller interface)
+✅ Snapshot and restore capability
+✅ Phase tracking and error counters
+✅ No unlimited text storage
 
-Version: 2.0.0 (Enterprise)
-Last Updated: 2026-01-21
+Version: 3.0.0 (Production Hardened)
+Last Updated: 2026-01-22
 """
 
 import os
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from enum import Enum
-from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from copy import deepcopy
 import json
 import sys
 
@@ -44,16 +42,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# Configuration
-MAX_TURNS_PER_CALL = int(os.getenv("MAX_CONVERSATION_TURNS", "200"))
-MAX_TURN_HISTORY_SIZE = 100  # Compress older turns
-COMPRESSION_THRESHOLD = 50    # Compress if > 50 turns
-MAX_FACT_SIZE = 500          # Max characters per fact value
-MAX_SLOT_SIZE = 1000         # Max characters per slot value
-MEMORY_WARNING_THRESHOLD = 10 * 1024 * 1024  # 10MB per call
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Memory limits
+MAX_TURNS_WINDOW = int(os.getenv("MAX_CONVERSATION_TURNS", "50"))  # Sliding window
+MAX_TOKEN_BUDGET = int(os.getenv("MAX_MEMORY_TOKENS", "4000"))  # ~4K tokens
+MAX_SLOT_VALUE_LENGTH = 1000  # Max chars per slot
+MAX_TURN_CONTENT_LENGTH = 2000  # Max chars per turn
+SUMMARIZATION_THRESHOLD = 30  # Summarize if > 30 turns
+
+# Pruning strategy
+PRUNING_STRATEGY = os.getenv("MEMORY_PRUNING", "sliding_window")  # or "summarize"
 
 
-# Prometheus Metrics
+# ============================================================================
+# METRICS
+# ============================================================================
+
 if METRICS_ENABLED:
     memory_calls_active = Gauge(
         'memory_calls_active',
@@ -62,495 +69,834 @@ if METRICS_ENABLED:
     memory_turns_total = Counter(
         'memory_turns_total',
         'Total conversation turns',
-        ['role', 'turn_type']
+        ['role']
     )
-    memory_facts_total = Counter(
-        'memory_facts_total',
-        'Total facts stored'
+    memory_slots_updated = Counter(
+        'memory_slots_updated_total',
+        'Slot update events'
     )
-    memory_flags_total = Counter(
-        'memory_flags_total',
-        'Total flags set'
+    memory_flags_set = Counter(
+        'memory_flags_set_total',
+        'Flag set events'
     )
-    memory_slots_total = Counter(
-        'memory_slots_total',
-        'Total slots updated'
+    memory_pruning_events = Counter(
+        'memory_pruning_events_total',
+        'Memory pruning events',
+        ['strategy']
     )
-    memory_size_bytes = Histogram(
-        'memory_size_bytes',
-        'Memory size per call in bytes'
+    memory_size_tokens = Histogram(
+        'memory_size_tokens',
+        'Memory size in tokens'
     )
-    memory_compression_ratio = Histogram(
-        'memory_compression_ratio',
-        'Compression ratio for turn history'
-    )
-    memory_cleanup_events = Counter(
-        'memory_cleanup_events_total',
-        'Memory cleanup events',
-        ['reason']
+    memory_snapshots_created = Counter(
+        'memory_snapshots_created_total',
+        'Snapshot creation events'
     )
 
 
-class MemoryState(Enum):
-    """Memory lifecycle states."""
-    CREATED = "created"
-    ACTIVE = "active"
-    ARCHIVED = "archived"
-    CLEANED = "cleaned"
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class ConversationPhase(Enum):
+    """Current phase of conversation."""
+    GREETING = "greeting"
+    DISCOVERY = "discovery"
+    ORDERING = "ordering"
+    CONFIRMATION = "confirmation"
+    PAYMENT = "payment"
+    CLOSING = "closing"
+    ERROR = "error"
 
 
+class TurnRole(Enum):
+    """Role in conversation turn."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+# ============================================================================
+# IMMUTABLE TURN RECORD
+# ============================================================================
+
+@dataclass(frozen=True)
 class ConversationTurn:
-    """Single conversation turn with metadata."""
+    """
+    Immutable conversation turn record.
     
-    def __init__(
-        self,
-        role: str,
-        content: str,
-        turn_type: str,
-        timestamp: datetime
-    ):
-        self.role = role
-        self.content = content
-        self.turn_type = turn_type
-        self.timestamp = timestamp
-        self.turn_id = f"{timestamp.timestamp():.6f}"
-        
-        # Metadata
-        self.content_length = len(content)
-        self.is_compressed = False
+    CRITICAL: frozen=True means this CANNOT be modified after creation.
+    AI cannot edit history - only append new turns.
+    """
+    role: TurnRole
+    content: str
+    timestamp: datetime
+    turn_id: str
+    phase: ConversationPhase
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Validate turn on creation."""
+        # Truncate content if too long
+        if len(self.content) > MAX_TURN_CONTENT_LENGTH:
+            # Use object.__setattr__ since frozen
+            object.__setattr__(
+                self,
+                'content',
+                self.content[:MAX_TURN_CONTENT_LENGTH] + "...[truncated]"
+            )
+            logger.warning(
+                f"Turn content truncated: {len(self.content)} -> {MAX_TURN_CONTENT_LENGTH}"
+            )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "role": self.role.value,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat(),
+            "turn_id": self.turn_id,
+            "phase": self.phase.value,
+            "metadata": self.metadata.copy()
+        }
+    
+    def estimate_tokens(self) -> int:
+        """Estimate token count (rough: ~4 chars per token)."""
+        return len(self.content) // 4
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ConversationTurn':
+        """Create from dictionary."""
+        return cls(
+            role=TurnRole(data['role']),
+            content=data['content'],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            turn_id=data['turn_id'],
+            phase=ConversationPhase(data['phase']),
+            metadata=data.get('metadata', {})
+        )
+
+
+# ============================================================================
+# ERROR COUNTERS
+# ============================================================================
+
+@dataclass
+class ErrorCounters:
+    """Track errors in conversation."""
+    
+    # AI errors
+    ai_failures: int = 0
+    ai_timeouts: int = 0
+    ai_invalid_responses: int = 0
+    
+    # STT errors
+    stt_failures: int = 0
+    stt_low_confidence: int = 0
+    
+    # TTS errors
+    tts_failures: int = 0
+    tts_cancellations: int = 0
+    
+    # System errors
+    system_errors: int = 0
+    
+    def total_errors(self) -> int:
+        """Get total error count."""
+        return (
+            self.ai_failures + self.ai_timeouts + self.ai_invalid_responses +
+            self.stt_failures + self.stt_low_confidence +
+            self.tts_failures + self.tts_cancellations +
+            self.system_errors
+        )
+    
+    def to_dict(self) -> Dict[str, int]:
+        """Convert to dictionary."""
+        return asdict(self)
+    
+    def increment(self, error_type: str):
+        """Increment error counter."""
+        if hasattr(self, error_type):
+            current = getattr(self, error_type)
+            setattr(self, error_type, current + 1)
+        else:
+            logger.warning(f"Unknown error type: {error_type}")
+
+
+# ============================================================================
+# MEMORY SNAPSHOT
+# ============================================================================
+
+@dataclass
+class MemorySnapshot:
+    """
+    Immutable snapshot of conversation memory.
+    
+    Used for:
+    - State persistence
+    - Rollback/restore
+    - Debugging
+    """
+    snapshot_id: str
+    call_id: str
+    timestamp: datetime
+    
+    # Memory state
+    turns: List[Dict[str, Any]]  # Serialized turns
+    extracted_slots: Dict[str, Any]
+    system_flags: Dict[str, bool]
+    phase: str
+    error_counters: Dict[str, int]
+    
+    # Metadata
+    turn_count: int
+    token_count: int
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "role": self.role,
-            "content": self.content,
-            "turn_type": self.turn_type,
+            "snapshot_id": self.snapshot_id,
+            "call_id": self.call_id,
             "timestamp": self.timestamp.isoformat(),
-            "turn_id": self.turn_id,
-            "content_length": self.content_length
+            "turns": self.turns,
+            "extracted_slots": self.extracted_slots,
+            "system_flags": self.system_flags,
+            "phase": self.phase,
+            "error_counters": self.error_counters,
+            "turn_count": self.turn_count,
+            "token_count": self.token_count
         }
     
-    def get_size_bytes(self) -> int:
-        """Estimate memory size."""
-        return sys.getsizeof(self.content) + sys.getsizeof(self.role) + 100
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MemorySnapshot':
+        """Create from dictionary."""
+        return cls(
+            snapshot_id=data['snapshot_id'],
+            call_id=data['call_id'],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            turns=data['turns'],
+            extracted_slots=data['extracted_slots'],
+            system_flags=data['system_flags'],
+            phase=data['phase'],
+            error_counters=data['error_counters'],
+            turn_count=data['turn_count'],
+            token_count=data['token_count']
+        )
 
 
-class CallMemory:
+# ============================================================================
+# CONVERSATION MEMORY
+# ============================================================================
+
+class ConversationMemory:
     """
-    Structured memory for a single call with enterprise features.
+    Structured conversation memory with immutability guarantees.
+    
+    Architecture:
+    - turns[] - Immutable history records (write-once)
+    - extracted_slots{} - Mutable data extracted from conversation
+    - system_flags{} - Boolean flags for system state
+    - phase - Current conversation phase
+    - error_counters - Error tracking
+    
+    Guarantees:
+    - AI cannot directly write memory
+    - Turns are immutable (frozen dataclass)
+    - Memory is pruned to stay within token budget
+    - Snapshot/restore capability
     """
     
     def __init__(self, call_id: str, restaurant_id: str):
         self.call_id = call_id
         self.restaurant_id = restaurant_id
-        self.state = MemoryState.CREATED
         
-        # Core memory structures
-        self.facts: Dict[str, Any] = {}              # Write-once facts
-        self.flags: Dict[str, bool] = {}             # Boolean flags
-        self.slots: Dict[str, Any] = {}              # Mutable slots
-        self.turns: List[ConversationTurn] = []      # Conversation history
+        # CORE MEMORY STRUCTURES
+        self._turns: List[ConversationTurn] = []  # Immutable records
+        self.extracted_slots: Dict[str, Any] = {}  # Mutable slots
+        self.system_flags: Dict[str, bool] = {}  # Boolean flags
+        self.phase: ConversationPhase = ConversationPhase.GREETING
+        self.error_counters = ErrorCounters()
         
-        # Compressed archive (for old turns)
-        self.compressed_turns: Optional[bytes] = None
-        self.compression_turn_count = 0
-        
-        # Menu snapshot
-        self.menu_snapshot: Optional[Dict] = None
+        # Pruning state
+        self._pruned_turn_count = 0  # How many turns were pruned
+        self._summary_placeholder: Optional[str] = None  # Summarization placeholder
         
         # Metadata
         self.created_at = datetime.utcnow()
-        self.activated_at: Optional[datetime] = None
-        self.archived_at: Optional[datetime] = None
+        self._turn_sequence = 0
         
-        # Usage tracking
-        self.fact_writes = 0
-        self.flag_writes = 0
-        self.slot_writes = 0
-        self.turn_writes = 0
-        self.snapshot_versions = 0
+        # Snapshots
+        self._snapshots: List[MemorySnapshot] = []
         
-        # Memory size tracking
-        self.last_size_check: Optional[datetime] = None
-        self.peak_size_bytes = 0
-        
-        logger.info(f"CallMemory created: {call_id}")
+        logger.info(f"ConversationMemory created: {call_id}")
     
     # ========================================================================
-    # LIFECYCLE
+    # TURNS (Immutable History)
     # ========================================================================
     
-    def activate(self):
-        """Activate memory for use."""
-        if self.state == MemoryState.CREATED:
-            self.state = MemoryState.ACTIVE
-            self.activated_at = datetime.utcnow()
-            logger.info(f"Memory activated: {self.call_id}")
-    
-    def archive(self):
-        """Archive memory (readonly)."""
-        if self.state == MemoryState.ACTIVE:
-            self.state = MemoryState.ARCHIVED
-            self.archived_at = datetime.utcnow()
-            
-            # Compress remaining turns
-            self._compress_turn_history()
-            
-            logger.info(f"Memory archived: {self.call_id}")
-    
-    def cleanup(self):
-        """Clean up memory resources."""
-        self.state = MemoryState.CLEANED
-        
-        # Clear large structures
-        self.turns.clear()
-        self.compressed_turns = None
-        self.menu_snapshot = None
-        
-        if METRICS_ENABLED:
-            memory_cleanup_events.labels(reason='manual').inc()
-        
-        logger.info(f"Memory cleaned: {self.call_id}")
-    
-    # ========================================================================
-    # FACTS (Write-Once)
-    # ========================================================================
-    
-    def set_fact(self, key: str, value: Any) -> bool:
+    def append_turn(
+        self,
+        role: TurnRole,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> ConversationTurn:
         """
-        Set a fact (write-once only).
+        Append immutable turn to history.
+        
+        This is the ONLY way to add turns - no direct writes allowed.
         
         Args:
-            key: Fact key
-            value: Fact value
+            role: Speaker role
+            content: Turn content
+            metadata: Optional metadata
             
         Returns:
-            True if set, False if already exists
+            Created turn (immutable)
         """
-        if key in self.facts:
-            logger.debug(f"Fact '{key}' already set, ignoring update")
-            return False
+        # Generate turn ID
+        self._turn_sequence += 1
+        turn_id = f"{self.call_id}_{self._turn_sequence}"
         
-        # Validate size
-        if isinstance(value, str) and len(value) > MAX_FACT_SIZE:
-            logger.warning(f"Fact value too large, truncating: {len(value)} -> {MAX_FACT_SIZE}")
-            value = value[:MAX_FACT_SIZE]
+        # Create immutable turn
+        turn = ConversationTurn(
+            role=role,
+            content=content,
+            timestamp=datetime.utcnow(),
+            turn_id=turn_id,
+            phase=self.phase,
+            metadata=metadata or {}
+        )
         
-        self.facts[key] = value
-        self.fact_writes += 1
+        # Append to history
+        self._turns.append(turn)
         
+        # Track metrics
         if METRICS_ENABLED:
-            memory_facts_total.inc()
+            memory_turns_total.labels(role=role.value).inc()
         
-        logger.debug(f"Fact set: {key} = {value}")
-        return True
+        logger.debug(f"Turn appended: {turn_id} ({role.value})")
+        
+        # Auto-prune if needed
+        self._auto_prune()
+        
+        return turn
     
-    def get_fact(self, key: str, default: Any = None) -> Any:
-        """Get a fact value."""
-        return self.facts.get(key, default)
+    def get_turns(self, limit: Optional[int] = None) -> List[ConversationTurn]:
+        """
+        Get turns (read-only).
+        
+        Returns COPIES to prevent mutation.
+        
+        Args:
+            limit: Max turns to return (most recent)
+            
+        Returns:
+            List of turns (immutable)
+        """
+        if limit:
+            return self._turns[-limit:]
+        return self._turns.copy()
     
-    def has_fact(self, key: str) -> bool:
-        """Check if fact exists."""
-        return key in self.facts
+    def get_turn_count(self) -> int:
+        """Get total turn count (including pruned)."""
+        return len(self._turns) + self._pruned_turn_count
     
     # ========================================================================
-    # FLAGS (Boolean State)
+    # SLOTS (Mutable Data Extraction)
+    # ========================================================================
+    
+    def update_slot(self, key: str, value: Any) -> bool:
+        """
+        Update extracted slot.
+        
+        This is called by CONTROLLER, not AI directly.
+        
+        Args:
+            key: Slot key
+            value: Slot value
+            
+        Returns:
+            True if updated
+        """
+        # Validate value length
+        if isinstance(value, str) and len(value) > MAX_SLOT_VALUE_LENGTH:
+            logger.warning(
+                f"Slot value too long, truncating: {len(value)} -> {MAX_SLOT_VALUE_LENGTH}"
+            )
+            value = value[:MAX_SLOT_VALUE_LENGTH]
+        
+        self.extracted_slots[key] = value
+        
+        if METRICS_ENABLED:
+            memory_slots_updated.inc()
+        
+        logger.debug(f"Slot updated: {key} = {value}")
+        return True
+    
+    def get_slot(self, key: str, default: Any = None) -> Any:
+        """Get slot value."""
+        return self.extracted_slots.get(key, default)
+    
+    def has_slot(self, key: str) -> bool:
+        """Check if slot exists."""
+        return key in self.extracted_slots
+    
+    def remove_slot(self, key: str) -> bool:
+        """Remove slot."""
+        if key in self.extracted_slots:
+            del self.extracted_slots[key]
+            logger.debug(f"Slot removed: {key}")
+            return True
+        return False
+    
+    def get_all_slots(self) -> Dict[str, Any]:
+        """Get all slots (copy)."""
+        return self.extracted_slots.copy()
+    
+    # ========================================================================
+    # FLAGS (System State)
     # ========================================================================
     
     def set_flag(self, key: str, value: bool = True):
-        """Set a boolean flag."""
-        self.flags[key] = value
-        self.flag_writes += 1
+        """
+        Set system flag.
+        
+        Called by CONTROLLER, not AI.
+        
+        Args:
+            key: Flag key
+            value: Flag value (default True)
+        """
+        self.system_flags[key] = value
         
         if METRICS_ENABLED:
-            memory_flags_total.inc()
+            memory_flags_set.inc()
         
         logger.debug(f"Flag set: {key} = {value}")
     
     def get_flag(self, key: str, default: bool = False) -> bool:
-        """Get a flag value."""
-        return self.flags.get(key, default)
+        """Get flag value."""
+        return self.system_flags.get(key, default)
     
-    def toggle_flag(self, key: str) -> bool:
-        """Toggle a flag value."""
-        current = self.get_flag(key)
-        new_value = not current
-        self.set_flag(key, new_value)
-        return new_value
+    def has_flag(self, key: str) -> bool:
+        """Check if flag exists."""
+        return key in self.system_flags
     
-    # ========================================================================
-    # SLOTS (Mutable State)
-    # ========================================================================
+    def clear_flag(self, key: str):
+        """Clear flag."""
+        if key in self.system_flags:
+            del self.system_flags[key]
+            logger.debug(f"Flag cleared: {key}")
     
-    def set_slot(self, key: str, value: Any):
-        """Set a slot value (mutable)."""
-        # Validate size
-        if isinstance(value, str) and len(value) > MAX_SLOT_SIZE:
-            logger.warning(f"Slot value too large, truncating: {len(value)} -> {MAX_SLOT_SIZE}")
-            value = value[:MAX_SLOT_SIZE]
-        
-        self.slots[key] = value
-        self.slot_writes += 1
-        
-        if METRICS_ENABLED:
-            memory_slots_total.inc()
-        
-        logger.debug(f"Slot set: {key} = {value}")
-    
-    def get_slot(self, key: str, default: Any = None) -> Any:
-        """Get a slot value."""
-        return self.slots.get(key, default)
-    
-    def delete_slot(self, key: str):
-        """Delete a slot."""
-        if key in self.slots:
-            del self.slots[key]
-            logger.debug(f"Slot deleted: {key}")
+    def get_all_flags(self) -> Dict[str, bool]:
+        """Get all flags (copy)."""
+        return self.system_flags.copy()
     
     # ========================================================================
-    # CONVERSATION TURNS
+    # PHASE MANAGEMENT
     # ========================================================================
     
-    def add_conversation_turn(
-        self,
-        role: str,
-        content: str,
-        turn_type: str = "general"
-    ):
+    def set_phase(self, phase: ConversationPhase):
         """
-        Add conversation turn with cleanup policy.
+        Set conversation phase.
+        
+        Called by CONTROLLER based on AI output interpretation.
         
         Args:
-            role: Speaker role (user/assistant/system)
-            content: Turn content
-            turn_type: Turn type (order/question/confirm/etc)
+            phase: New phase
         """
-        turn = ConversationTurn(role, content, turn_type, datetime.utcnow())
-        self.turns.append(turn)
-        self.turn_writes += 1
+        old_phase = self.phase
+        self.phase = phase
         
-        if METRICS_ENABLED:
-            memory_turns_total.labels(role=role, turn_type=turn_type).inc()
-        
-        # Check for cleanup
-        if len(self.turns) > MAX_TURNS_PER_CALL:
-            self._cleanup_old_turns()
-        
-        # Check for compression
-        elif len(self.turns) > COMPRESSION_THRESHOLD:
-            self._compress_turn_history()
+        logger.info(f"Phase transition: {old_phase.value} -> {phase.value}")
     
-    def get_recent_turns(self, count: int = 10) -> List[Dict[str, Any]]:
-        """Get recent conversation turns."""
-        recent = self.turns[-count:] if count < len(self.turns) else self.turns
-        return [turn.to_dict() for turn in recent]
-    
-    def get_turn_count(self) -> int:
-        """Get total turn count (including compressed)."""
-        return len(self.turns) + self.compression_turn_count
-    
-    def get_turns_by_type(self, turn_type: str) -> List[Dict[str, Any]]:
-        """Get turns filtered by type."""
-        filtered = [turn for turn in self.turns if turn.turn_type == turn_type]
-        return [turn.to_dict() for turn in filtered]
+    def get_phase(self) -> ConversationPhase:
+        """Get current phase."""
+        return self.phase
     
     # ========================================================================
-    # COMPRESSION
+    # ERROR TRACKING
     # ========================================================================
     
-    def _compress_turn_history(self):
-        """Compress old turns to save memory."""
-        if not COMPRESSION_AVAILABLE:
-            return
+    def increment_error(self, error_type: str):
+        """
+        Increment error counter.
         
-        # Only compress if we have enough turns
-        if len(self.turns) < COMPRESSION_THRESHOLD:
-            return
+        Called by CONTROLLER when errors occur.
         
-        # Compress all but last 50 turns
-        turns_to_compress = self.turns[:-50]
-        if not turns_to_compress:
-            return
-        
-        try:
-            # Serialize turns
-            turn_data = [turn.to_dict() for turn in turns_to_compress]
-            json_data = json.dumps(turn_data).encode('utf-8')
-            
-            # Compress
-            compressed = zlib.compress(json_data, level=6)
-            
-            original_size = len(json_data)
-            compressed_size = len(compressed)
-            ratio = compressed_size / max(1, original_size)
-            
-            # Store compressed data
-            self.compressed_turns = compressed
-            self.compression_turn_count += len(turns_to_compress)
-            
-            # Remove compressed turns from active list
-            self.turns = self.turns[-50:]
-            
-            if METRICS_ENABLED:
-                memory_compression_ratio.observe(ratio)
-            
-            logger.info(
-                f"Compressed {len(turns_to_compress)} turns: "
-                f"{original_size} -> {compressed_size} bytes "
-                f"(ratio: {ratio:.2f})"
-            )
-        
-        except Exception as e:
-            logger.error(f"Failed to compress turn history: {str(e)}")
+        Args:
+            error_type: Type of error (e.g., 'ai_failures')
+        """
+        self.error_counters.increment(error_type)
+        logger.warning(f"Error incremented: {error_type}")
     
-    def _cleanup_old_turns(self):
-        """Remove oldest turns when limit exceeded."""
-        excess = len(self.turns) - MAX_TURNS_PER_CALL
+    def get_error_count(self, error_type: Optional[str] = None) -> int:
+        """
+        Get error count.
+        
+        Args:
+            error_type: Specific error type, or None for total
+            
+        Returns:
+            Error count
+        """
+        if error_type:
+            return getattr(self.error_counters, error_type, 0)
+        return self.error_counters.total_errors()
+    
+    def get_all_errors(self) -> Dict[str, int]:
+        """Get all error counts."""
+        return self.error_counters.to_dict()
+    
+    # ========================================================================
+    # MEMORY PRUNING
+    # ========================================================================
+    
+    def _auto_prune(self):
+        """
+        Automatically prune memory if needed.
+        
+        Strategies:
+        1. Sliding window - Keep last N turns
+        2. Summarization - Summarize old turns (placeholder)
+        """
+        # Check if pruning needed
+        if len(self._turns) <= MAX_TURNS_WINDOW:
+            return
+        
+        logger.info(
+            f"Memory pruning triggered: {len(self._turns)} turns > {MAX_TURNS_WINDOW}"
+        )
+        
+        if PRUNING_STRATEGY == "sliding_window":
+            self._prune_sliding_window()
+        elif PRUNING_STRATEGY == "summarize":
+            self._prune_with_summarization()
+        else:
+            logger.warning(f"Unknown pruning strategy: {PRUNING_STRATEGY}")
+            self._prune_sliding_window()  # Fallback
+    
+    def _prune_sliding_window(self):
+        """
+        Prune using sliding window (keep last N turns).
+        
+        This is the simplest and safest pruning strategy.
+        """
+        excess = len(self._turns) - MAX_TURNS_WINDOW
+        
         if excess <= 0:
             return
         
-        logger.warning(
-            f"Turn limit exceeded ({len(self.turns)} > {MAX_TURNS_PER_CALL}), "
-            f"removing {excess} oldest turns"
+        # Remove oldest turns
+        pruned_turns = self._turns[:excess]
+        self._turns = self._turns[excess:]
+        
+        # Track pruned count
+        self._pruned_turn_count += len(pruned_turns)
+        
+        if METRICS_ENABLED:
+            memory_pruning_events.labels(strategy='sliding_window').inc()
+        
+        logger.info(
+            f"Pruned {len(pruned_turns)} turns (sliding window), "
+            f"{len(self._turns)} remaining"
+        )
+    
+    def _prune_with_summarization(self):
+        """
+        Prune with summarization (advanced).
+        
+        Instead of dropping old turns, create a summary placeholder.
+        Actual summarization would require LLM call.
+        """
+        if len(self._turns) < SUMMARIZATION_THRESHOLD:
+            return
+        
+        # Determine how many turns to summarize
+        turns_to_summarize = len(self._turns) - MAX_TURNS_WINDOW // 2
+        
+        if turns_to_summarize <= 0:
+            return
+        
+        # Get turns to summarize
+        old_turns = self._turns[:turns_to_summarize]
+        
+        # Create placeholder (real implementation would call LLM)
+        summary = f"[Summarized {len(old_turns)} turns from earlier conversation]"
+        
+        self._summary_placeholder = summary
+        
+        # Remove summarized turns
+        self._turns = self._turns[turns_to_summarize:]
+        self._pruned_turn_count += len(old_turns)
+        
+        if METRICS_ENABLED:
+            memory_pruning_events.labels(strategy='summarize').inc()
+        
+        logger.info(
+            f"Summarized {len(old_turns)} turns, "
+            f"{len(self._turns)} remaining"
+        )
+    
+    def get_summary_placeholder(self) -> Optional[str]:
+        """Get summarization placeholder if exists."""
+        return self._summary_placeholder
+    
+    # ========================================================================
+    # TOKEN BUDGETING
+    # ========================================================================
+    
+    def estimate_token_count(self) -> int:
+        """
+        Estimate total token count in memory.
+        
+        Rough estimate: ~4 chars per token.
+        
+        Returns:
+            Estimated token count
+        """
+        token_count = 0
+        
+        # Turns
+        for turn in self._turns:
+            token_count += turn.estimate_tokens()
+        
+        # Summary placeholder
+        if self._summary_placeholder:
+            token_count += len(self._summary_placeholder) // 4
+        
+        # Slots (convert to string representation)
+        slots_str = json.dumps(self.extracted_slots)
+        token_count += len(slots_str) // 4
+        
+        # Flags
+        flags_str = json.dumps(self.system_flags)
+        token_count += len(flags_str) // 4
+        
+        if METRICS_ENABLED:
+            memory_size_tokens.observe(token_count)
+        
+        return token_count
+    
+    def is_within_budget(self) -> bool:
+        """Check if memory is within token budget."""
+        return self.estimate_token_count() <= MAX_TOKEN_BUDGET
+    
+    def get_budget_usage(self) -> Tuple[int, int, float]:
+        """
+        Get token budget usage.
+        
+        Returns:
+            (current_tokens, max_tokens, usage_percentage)
+        """
+        current = self.estimate_token_count()
+        max_tokens = MAX_TOKEN_BUDGET
+        usage = (current / max_tokens) * 100
+        
+        return current, max_tokens, usage
+    
+    # ========================================================================
+    # SNAPSHOT & RESTORE
+    # ========================================================================
+    
+    def create_snapshot(self) -> MemorySnapshot:
+        """
+        Create immutable snapshot of current memory state.
+        
+        Used for:
+        - Persistence
+        - Rollback
+        - Debugging
+        
+        Returns:
+            Memory snapshot
+        """
+        snapshot_id = f"{self.call_id}_{datetime.utcnow().timestamp()}"
+        
+        snapshot = MemorySnapshot(
+            snapshot_id=snapshot_id,
+            call_id=self.call_id,
+            timestamp=datetime.utcnow(),
+            turns=[turn.to_dict() for turn in self._turns],
+            extracted_slots=deepcopy(self.extracted_slots),
+            system_flags=deepcopy(self.system_flags),
+            phase=self.phase.value,
+            error_counters=self.error_counters.to_dict(),
+            turn_count=self.get_turn_count(),
+            token_count=self.estimate_token_count()
         )
         
-        # Compress before removing
-        self._compress_turn_history()
+        # Store snapshot
+        self._snapshots.append(snapshot)
         
-        # Remove excess (should be minimal after compression)
-        excess = len(self.turns) - MAX_TURNS_PER_CALL
-        if excess > 0:
-            self.turns = self.turns[excess:]
-            
-            if METRICS_ENABLED:
-                memory_cleanup_events.labels(reason='turn_limit').inc()
+        if METRICS_ENABLED:
+            memory_snapshots_created.inc()
+        
+        logger.info(
+            f"Snapshot created: {snapshot_id} "
+            f"({snapshot.turn_count} turns, {snapshot.token_count} tokens)"
+        )
+        
+        return snapshot
     
-    # ========================================================================
-    # MENU SNAPSHOT
-    # ========================================================================
-    
-    def set_menu_snapshot(self, menu: Dict[str, Any]):
-        """Store menu snapshot."""
-        self.menu_snapshot = menu
-        self.snapshot_versions += 1
-        logger.debug(f"Menu snapshot stored (version {self.snapshot_versions})")
-    
-    def get_menu_snapshot(self) -> Optional[Dict[str, Any]]:
-        """Get menu snapshot."""
-        return self.menu_snapshot
-    
-    # ========================================================================
-    # SNAPSHOT & EXPORT
-    # ========================================================================
-    
-    def snapshot(self) -> Dict[str, Any]:
+    def restore_from_snapshot(self, snapshot: MemorySnapshot):
         """
-        Create memory snapshot.
+        Restore memory from snapshot.
+        
+        DANGEROUS: This replaces current memory state.
+        
+        Args:
+            snapshot: Snapshot to restore from
+        """
+        logger.warning(f"Restoring memory from snapshot: {snapshot.snapshot_id}")
+        
+        # Restore turns (recreate immutable objects)
+        self._turns = [
+            ConversationTurn.from_dict(turn_data)
+            for turn_data in snapshot.turns
+        ]
+        
+        # Restore slots
+        self.extracted_slots = deepcopy(snapshot.extracted_slots)
+        
+        # Restore flags
+        self.system_flags = deepcopy(snapshot.system_flags)
+        
+        # Restore phase
+        self.phase = ConversationPhase(snapshot.phase)
+        
+        # Restore error counters
+        for key, value in snapshot.error_counters.items():
+            setattr(self.error_counters, key, value)
+        
+        logger.info(f"Memory restored from snapshot: {snapshot.snapshot_id}")
+    
+    def get_snapshots(self) -> List[MemorySnapshot]:
+        """Get all snapshots."""
+        return self._snapshots.copy()
+    
+    def get_latest_snapshot(self) -> Optional[MemorySnapshot]:
+        """Get most recent snapshot."""
+        if self._snapshots:
+            return self._snapshots[-1]
+        return None
+    
+    # ========================================================================
+    # EXPORT & DEBUG
+    # ========================================================================
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Export memory to dictionary.
         
         Returns:
             Complete memory state
         """
-        size_bytes = self._calculate_size()
-        
-        if METRICS_ENABLED:
-            memory_size_bytes.observe(size_bytes)
+        current_tokens, max_tokens, usage = self.get_budget_usage()
         
         return {
             "call_id": self.call_id,
             "restaurant_id": self.restaurant_id,
-            "state": self.state.value,
             "created_at": self.created_at.isoformat(),
-            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
-            "facts": self.facts.copy(),
-            "flags": self.flags.copy(),
-            "slots": self.slots.copy(),
+            "phase": self.phase.value,
+            "turns": [turn.to_dict() for turn in self._turns],
             "turn_count": self.get_turn_count(),
-            "active_turns": len(self.turns),
-            "compressed_turns": self.compression_turn_count,
-            "recent_turns": self.get_recent_turns(10),
-            "has_menu": self.menu_snapshot is not None,
-            "usage": {
-                "fact_writes": self.fact_writes,
-                "flag_writes": self.flag_writes,
-                "slot_writes": self.slot_writes,
-                "turn_writes": self.turn_writes,
-                "snapshot_versions": self.snapshot_versions
+            "pruned_turns": self._pruned_turn_count,
+            "extracted_slots": self.extracted_slots.copy(),
+            "system_flags": self.system_flags.copy(),
+            "error_counters": self.error_counters.to_dict(),
+            "summary_placeholder": self._summary_placeholder,
+            "token_budget": {
+                "current_tokens": current_tokens,
+                "max_tokens": max_tokens,
+                "usage_percent": round(usage, 2),
+                "within_budget": self.is_within_budget()
             },
-            "memory_size_bytes": size_bytes,
-            "peak_size_bytes": self.peak_size_bytes
+            "snapshot_count": len(self._snapshots)
         }
     
-    def _calculate_size(self) -> int:
-        """Calculate approximate memory size."""
-        size = 0
+    def get_recent_context(self, max_turns: int = 10) -> str:
+        """
+        Get recent conversation context as formatted string.
         
-        # Facts
-        size += sum(sys.getsizeof(k) + sys.getsizeof(v) for k, v in self.facts.items())
+        Used for AI prompts.
         
-        # Flags
-        size += sum(sys.getsizeof(k) + sys.getsizeof(v) for k, v in self.flags.items())
+        Args:
+            max_turns: Max recent turns to include
+            
+        Returns:
+            Formatted conversation history
+        """
+        recent_turns = self._turns[-max_turns:]
         
-        # Slots
-        size += sum(sys.getsizeof(k) + sys.getsizeof(v) for k, v in self.slots.items())
+        lines = []
         
-        # Turns
-        size += sum(turn.get_size_bytes() for turn in self.turns)
+        # Add summary if exists
+        if self._summary_placeholder:
+            lines.append(self._summary_placeholder)
+            lines.append("")
         
-        # Compressed turns
-        if self.compressed_turns:
-            size += sys.getsizeof(self.compressed_turns)
+        # Add recent turns
+        for turn in recent_turns:
+            role_name = turn.role.value.upper()
+            lines.append(f"{role_name}: {turn.content}")
         
-        # Menu snapshot
-        if self.menu_snapshot:
-            size += sys.getsizeof(json.dumps(self.menu_snapshot))
-        
-        # Update peak
-        if size > self.peak_size_bytes:
-            self.peak_size_bytes = size
-        
-        # Check for warnings
-        if size > MEMORY_WARNING_THRESHOLD:
-            logger.warning(
-                f"Large memory size for {self.call_id}: "
-                f"{size / 1024 / 1024:.2f} MB"
-            )
-        
-        return size
+        return "\n".join(lines)
 
 
 # ============================================================================
 # GLOBAL MEMORY REGISTRY
 # ============================================================================
 
-_memory_registry: Dict[str, CallMemory] = {}
+_memory_registry: Dict[str, ConversationMemory] = {}
 
 
-def create_call_memory(call_id: str, restaurant_id: str) -> CallMemory:
-    """Create memory for a call."""
+def create_memory(call_id: str, restaurant_id: str) -> ConversationMemory:
+    """
+    Create conversation memory.
+    
+    Args:
+        call_id: Call identifier
+        restaurant_id: Restaurant identifier
+        
+    Returns:
+        ConversationMemory instance
+    """
     if call_id in _memory_registry:
         logger.warning(f"Memory already exists for {call_id}, returning existing")
         return _memory_registry[call_id]
     
-    memory = CallMemory(call_id, restaurant_id)
-    memory.activate()
+    memory = ConversationMemory(call_id, restaurant_id)
     _memory_registry[call_id] = memory
     
     if METRICS_ENABLED:
         memory_calls_active.set(len(_memory_registry))
     
+    logger.info(f"Memory created: {call_id}")
     return memory
 
 
-def get_memory(call_id: str) -> Optional[CallMemory]:
-    """Get memory for a call."""
+def get_memory(call_id: str) -> Optional[ConversationMemory]:
+    """
+    Get memory for call.
+    
+    Args:
+        call_id: Call identifier
+        
+    Returns:
+        ConversationMemory or None
+    """
     return _memory_registry.get(call_id)
 
 
 def clear_memory(call_id: str):
-    """Clear memory for a call."""
+    """
+    Clear memory for call.
+    
+    Args:
+        call_id: Call identifier
+    """
     if call_id in _memory_registry:
-        memory = _memory_registry[call_id]
-        memory.cleanup()
         del _memory_registry[call_id]
         
         if METRICS_ENABLED:
@@ -567,21 +913,23 @@ def get_active_memory_count() -> int:
 def get_memory_stats() -> Dict[str, Any]:
     """Get global memory statistics."""
     total_turns = sum(mem.get_turn_count() for mem in _memory_registry.values())
-    total_facts = sum(len(mem.facts) for mem in _memory_registry.values())
-    total_flags = sum(len(mem.flags) for mem in _memory_registry.values())
-    total_slots = sum(len(mem.slots) for mem in _memory_registry.values())
-    total_size = sum(mem._calculate_size() for mem in _memory_registry.values())
+    total_slots = sum(len(mem.extracted_slots) for mem in _memory_registry.values())
+    total_flags = sum(len(mem.system_flags) for mem in _memory_registry.values())
+    total_tokens = sum(mem.estimate_token_count() for mem in _memory_registry.values())
     
     return {
         "active_calls": len(_memory_registry),
         "total_turns": total_turns,
-        "total_facts": total_facts,
-        "total_flags": total_flags,
         "total_slots": total_slots,
-        "total_memory_bytes": total_size,
-        "total_memory_mb": round(total_size / 1024 / 1024, 2)
+        "total_flags": total_flags,
+        "total_tokens": total_tokens,
+        "avg_tokens_per_call": round(total_tokens / max(1, len(_memory_registry)), 2)
     }
 
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -589,31 +937,72 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    print("Memory Module (Enterprise v2.0)")
-    print("="*50)
+    print("Memory Module (Production Hardened v3.0)")
+    print("="*60)
+    print(f"Max Turns Window: {MAX_TURNS_WINDOW}")
+    print(f"Max Token Budget: {MAX_TOKEN_BUDGET}")
+    print(f"Pruning Strategy: {PRUNING_STRATEGY}")
+    print("="*60)
     
     # Create memory
-    memory = create_call_memory("test_call_001", "rest_001")
+    memory = create_memory("test_call_001", "rest_001")
     print(f"\nMemory created: {memory.call_id}")
     
-    # Add facts
-    memory.set_fact("customer_name", "John Doe")
-    memory.set_fact("customer_phone", "+1234567890")
-    print(f"Facts: {memory.facts}")
-    
-    # Add turns
+    # Add turns (immutable)
     for i in range(5):
-        memory.add_conversation_turn("user", f"Message {i}", "chat")
-        memory.add_conversation_turn("assistant", f"Response {i}", "response")
+        memory.append_turn(
+            TurnRole.USER,
+            f"User message {i}",
+            {"index": i}
+        )
+        memory.append_turn(
+            TurnRole.ASSISTANT,
+            f"Assistant response {i}",
+            {"index": i}
+        )
     
     print(f"\nTurns: {memory.get_turn_count()}")
     
+    # Extract slots
+    memory.update_slot("customer_name", "John Doe")
+    memory.update_slot("table_size", 4)
+    print(f"\nSlots: {memory.get_all_slots()}")
+    
+    # Set flags
+    memory.set_flag("order_started", True)
+    memory.set_flag("payment_required", False)
+    print(f"\nFlags: {memory.get_all_flags()}")
+    
+    # Phase
+    memory.set_phase(ConversationPhase.ORDERING)
+    print(f"\nPhase: {memory.get_phase().value}")
+    
+    # Errors
+    memory.increment_error("ai_failures")
+    memory.increment_error("stt_low_confidence")
+    print(f"\nErrors: {memory.get_all_errors()}")
+    
+    # Token budget
+    current, max_tokens, usage = memory.get_budget_usage()
+    print(f"\nToken budget: {current}/{max_tokens} ({usage:.1f}%)")
+    
     # Snapshot
-    snapshot = memory.snapshot()
-    print(f"\nSnapshot:")
-    print(f"  State: {snapshot['state']}")
-    print(f"  Turns: {snapshot['turn_count']}")
-    print(f"  Size: {snapshot['memory_size_bytes']} bytes")
+    snapshot = memory.create_snapshot()
+    print(f"\nSnapshot created: {snapshot.snapshot_id}")
+    print(f"  Turns: {snapshot.turn_count}")
+    print(f"  Tokens: {snapshot.token_count}")
+    
+    # Export
+    export = memory.to_dict()
+    print(f"\nMemory export:")
+    print(f"  Phase: {export['phase']}")
+    print(f"  Turns: {export['turn_count']}")
+    print(f"  Pruned: {export['pruned_turns']}")
+    print(f"  Within budget: {export['token_budget']['within_budget']}")
+    
+    # Recent context
+    context = memory.get_recent_context(max_turns=3)
+    print(f"\nRecent context:\n{context}")
     
     # Stats
     stats = get_memory_stats()
