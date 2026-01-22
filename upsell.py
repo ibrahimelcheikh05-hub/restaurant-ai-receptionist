@@ -13,14 +13,19 @@ NEW FEATURES (Enterprise v2.0):
 ✅ Category performance analytics
 ✅ Time-to-accept tracking
 ✅ Multi-variant testing
+✅ Phase-locked state transitions
+✅ Rule-based triggers
+✅ Frequency limiting
+✅ User rejection memory
 
-Version: 2.0.0 (Enterprise)
-Last Updated: 2026-01-21
+Version: 2.1.0 (Enterprise)
+Last Updated: 2026-01-22
 """
 
 import logging
 from typing import Dict, List, Any, Optional, Set
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 import hashlib
 
 try:
@@ -38,6 +43,7 @@ MAX_UPSELLS_PER_CALL = 3
 MAX_UPSELLS_PER_TURN = 1
 MIN_ORDER_VALUE_FOR_UPSELL = 5.00
 MAX_UPSELL_PRICE_RATIO = 0.5  # Upsell price <= 50% of current order
+MIN_TIME_BETWEEN_UPSELLS = 30  # seconds
 
 
 # Prometheus Metrics
@@ -72,13 +78,6 @@ if METRICS_ENABLED:
     )
 
 
-# Configuration
-MAX_UPSELLS_PER_CALL = 3
-MAX_UPSELLS_PER_TURN = 1
-MIN_ORDER_VALUE_FOR_UPSELL = 5.00
-MAX_UPSELL_PRICE_RATIO = 0.5  # Upsell price <= 50% of current order
-
-
 # Upsell categories
 UPSELL_CATEGORIES = {
     "drinks": ["soda", "juice", "water", "tea", "coffee"],
@@ -88,10 +87,27 @@ UPSELL_CATEGORIES = {
 }
 
 
+class UpsellPhase(Enum):
+    """Valid call states for upsell triggers"""
+    ORDER_BUILDING = "order_building"
+    ORDER_CONFIRMATION = "order_confirmation"
+    CHECKOUT = "checkout"
+    DISABLED = "disabled"
+
+
+class UpsellTrigger(Enum):
+    """Rule-based upsell triggers"""
+    ITEM_ADDED = "item_added"
+    CATEGORY_MISSING = "category_missing"
+    ORDER_THRESHOLD = "order_threshold"
+    TIME_BASED = "time_based"
+    MANUAL = "manual"
+
+
 class UpsellTracker:
     """
     Track upsell history per call to prevent repetition.
-    Context-aware recommendation engine.
+    Context-aware recommendation engine with phase-locking.
     """
     
     def __init__(self, call_id: str):
@@ -129,15 +145,56 @@ class UpsellTracker:
         self.acceptance_times: Dict[str, float] = {}
         self.category_performance: Dict[str, Dict[str, int]] = {}
         
-        logger.debug(f"UpsellTracker created for {call_id} (strategy: {self.strategy})")
-    
-    def can_offer_upsell(self) -> bool:
-        """
-        Check if upsell can be offered.
+        # Phase-locking (v2.1)
+        self.current_phase = UpsellPhase.ORDER_BUILDING
+        self.allowed_phases: Set[UpsellPhase] = {
+            UpsellPhase.ORDER_BUILDING,
+            UpsellPhase.ORDER_CONFIRMATION
+        }
+        self.phase_transitions: List[Dict[str, Any]] = []
         
+        # Rule-based triggers (v2.1)
+        self.trigger_history: List[Dict[str, Any]] = []
+        self.consecutive_rejections = 0
+        self.max_consecutive_rejections = 2
+        
+        logger.debug(f"UpsellTracker created for {call_id} (strategy: {self.strategy}, phase: {self.current_phase.value})")
+    
+    def set_phase(self, phase: UpsellPhase):
+        """
+        Set current upsell phase with transition logging.
+        
+        Args:
+            phase: New phase
+        """
+        if phase != self.current_phase:
+            self.phase_transitions.append({
+                "from": self.current_phase.value,
+                "to": phase.value,
+                "timestamp": datetime.utcnow()
+            })
+            logger.info(f"Upsell phase transition for {self.call_id}: {self.current_phase.value} -> {phase.value}")
+            self.current_phase = phase
+    
+    def is_phase_allowed(self) -> bool:
+        """Check if current phase allows upsells."""
+        return self.current_phase in self.allowed_phases
+    
+    def can_offer_upsell(self, trigger: Optional[UpsellTrigger] = None) -> bool:
+        """
+        Check if upsell can be offered with rule-based validation.
+        
+        Args:
+            trigger: Optional trigger type for logging
+            
         Returns:
             True if upsell allowed
         """
+        # Check phase lock
+        if not self.is_phase_allowed():
+            logger.debug(f"Upsells blocked - wrong phase: {self.current_phase.value} for {self.call_id}")
+            return False
+        
         # Check disabled flag
         if self.upsells_disabled:
             logger.debug(f"Upsells disabled for {self.call_id}")
@@ -148,21 +205,34 @@ class UpsellTracker:
             logger.debug(f"Customer declined all upsells for {self.call_id}")
             return False
         
+        # Check consecutive rejections
+        if self.consecutive_rejections >= self.max_consecutive_rejections:
+            logger.debug(f"Max consecutive rejections reached for {self.call_id}")
+            return False
+        
         # Check hard cap
         if self.total_offered >= MAX_UPSELLS_PER_CALL:
             logger.debug(f"Max upsells reached for {self.call_id}")
             return False
         
+        # Check time-based frequency limit
+        if self.last_offer_time:
+            time_since_last = (datetime.utcnow() - self.last_offer_time).total_seconds()
+            if time_since_last < MIN_TIME_BETWEEN_UPSELLS:
+                logger.debug(f"Too soon since last upsell for {self.call_id} ({time_since_last:.1f}s)")
+                return False
+        
         return True
     
-    def mark_offered(self, item_id: str, category: Optional[str] = None, relevance: float = 0.0):
+    def mark_offered(self, item_id: str, category: Optional[str] = None, relevance: float = 0.0, trigger: Optional[UpsellTrigger] = None):
         """
-        Mark item as offered with metrics tracking.
+        Mark item as offered with metrics tracking and trigger logging.
         
         Args:
             item_id: Item identifier
             category: Item category
             relevance: Suggestion relevance score
+            trigger: Trigger that caused this offer
         """
         self.offered_items.add(item_id)
         if category:
@@ -171,6 +241,15 @@ class UpsellTracker:
         self.total_offered += 1
         self.last_offer_time = datetime.utcnow()
         self.offer_timestamps[item_id] = datetime.utcnow()
+        
+        # Track trigger
+        if trigger:
+            self.trigger_history.append({
+                "trigger": trigger.value,
+                "item_id": item_id,
+                "timestamp": datetime.utcnow(),
+                "phase": self.current_phase.value
+            })
         
         # Track category performance
         if category:
@@ -187,7 +266,7 @@ class UpsellTracker:
             if relevance > 0:
                 upsell_suggestion_quality.observe(relevance)
         
-        logger.debug(f"Upsell offered: {item_id} (total: {self.total_offered})")
+        logger.debug(f"Upsell offered: {item_id} (total: {self.total_offered}, trigger: {trigger.value if trigger else 'unknown'})")
     
     def _assign_ab_strategy(self) -> str:
         """Assign A/B test strategy based on call_id hash."""
@@ -197,7 +276,7 @@ class UpsellTracker:
     
     def mark_accepted(self, item_id: str, item_price: float = 0.0, category: str = "unknown"):
         """
-        Mark item as accepted with revenue tracking.
+        Mark item as accepted with revenue tracking and rejection counter reset.
         
         Args:
             item_id: Item identifier
@@ -207,6 +286,9 @@ class UpsellTracker:
         self.accepted_items.add(item_id)
         self.total_accepted += 1
         self.revenue_from_upsells += item_price
+        
+        # Reset consecutive rejections on acceptance
+        self.consecutive_rejections = 0
         
         # Track time to acceptance
         if item_id in self.offer_timestamps:
@@ -227,7 +309,7 @@ class UpsellTracker:
     
     def mark_rejected(self, item_id: str, category: str = "unknown"):
         """
-        Mark item as rejected.
+        Mark item as rejected with consecutive rejection tracking.
         
         Args:
             item_id: Item identifier
@@ -235,20 +317,23 @@ class UpsellTracker:
         """
         self.rejected_items.add(item_id)
         self.total_rejected += 1
+        self.consecutive_rejections += 1
         
         if METRICS_ENABLED:
             upsell_rejections_total.labels(category=category).inc()
         
-        logger.debug(f"Upsell rejected: {item_id}")
+        logger.debug(f"Upsell rejected: {item_id} (consecutive: {self.consecutive_rejections})")
     
     def mark_declined_all(self):
         """Mark that customer declined all upsells."""
         self.customer_declined_all = True
+        self.set_phase(UpsellPhase.DISABLED)
         logger.info(f"Customer declined all upsells for {self.call_id}")
     
     def disable_upsells(self):
         """Disable upsells for this call."""
         self.upsells_disabled = True
+        self.set_phase(UpsellPhase.DISABLED)
         logger.info(f"Upsells disabled for {self.call_id}")
     
     def was_offered(self, item_id: str) -> bool:
@@ -281,7 +366,11 @@ class UpsellTracker:
             "avg_acceptance_time_seconds": round(avg_acceptance_time, 2),
             "category_performance": self.category_performance,
             "upsells_disabled": self.upsells_disabled,
-            "customer_declined_all": self.customer_declined_all
+            "customer_declined_all": self.customer_declined_all,
+            "current_phase": self.current_phase.value,
+            "consecutive_rejections": self.consecutive_rejections,
+            "phase_transitions": self.phase_transitions,
+            "trigger_history": self.trigger_history
         }
 
 
@@ -309,29 +398,37 @@ def suggest_upsells(
     call_id: str,
     menu: Dict[str, Any],
     current_order: Optional[Dict[str, Any]] = None,
-    max_suggestions: int = MAX_UPSELLS_PER_TURN
+    max_suggestions: int = MAX_UPSELLS_PER_TURN,
+    trigger: Optional[UpsellTrigger] = None,
+    phase: Optional[UpsellPhase] = None
 ) -> List[Dict[str, Any]]:
     """
-    Generate context-aware upsell suggestions.
+    Generate context-aware upsell suggestions with phase-locking.
     
     Args:
         call_id: Call identifier
         menu: Menu data
         current_order: Current order data (optional)
         max_suggestions: Maximum suggestions to return
+        trigger: Trigger that caused this suggestion
+        phase: Current call phase (for validation)
         
     Returns:
         List of upsell suggestions
         
     Example:
-        >>> suggestions = suggest_upsells("call_123", menu, order)
+        >>> suggestions = suggest_upsells("call_123", menu, order, trigger=UpsellTrigger.ITEM_ADDED)
         >>> for sug in suggestions:
         >>>     print(sug["name"], sug["reason"])
     """
     tracker = _get_tracker(call_id)
     
+    # Update phase if provided
+    if phase:
+        tracker.set_phase(phase)
+    
     # Check if upsells allowed
-    if not tracker.can_offer_upsell():
+    if not tracker.can_offer_upsell(trigger):
         return []
     
     if not menu or not menu.get("items"):
@@ -374,12 +471,14 @@ def suggest_upsells(
     for suggestion in suggestions:
         tracker.mark_offered(
             suggestion["item_id"],
-            suggestion.get("category")
+            suggestion.get("category"),
+            suggestion.get("relevance", 0.0),
+            trigger
         )
     
     logger.info(
         f"Generated {len(suggestions)} upsell(s) for {call_id}: "
-        f"{[s['name'] for s in suggestions]}"
+        f"{[s['name'] for s in suggestions]} (trigger: {trigger.value if trigger else 'unknown'})"
     )
     
     return suggestions
@@ -656,28 +755,43 @@ def format_suggestion_text(suggestions: List[Dict[str, Any]]) -> str:
     return f"Would you like to add {items}, or {last['name']} (${last['price']:.2f})?"
 
 
-def mark_upsell_accepted(call_id: str, item_id: str):
+def set_upsell_phase(call_id: str, phase: UpsellPhase):
+    """
+    Set upsell phase for call.
+    
+    Args:
+        call_id: Call identifier
+        phase: New phase
+    """
+    tracker = _get_tracker(call_id)
+    tracker.set_phase(phase)
+
+
+def mark_upsell_accepted(call_id: str, item_id: str, item_price: float = 0.0, category: str = "unknown"):
     """
     Mark upsell as accepted.
     
     Args:
         call_id: Call identifier
         item_id: Item identifier
+        item_price: Item price
+        category: Item category
     """
     tracker = _get_tracker(call_id)
-    tracker.mark_accepted(item_id)
+    tracker.mark_accepted(item_id, item_price, category)
 
 
-def mark_upsell_rejected(call_id: str, item_id: str):
+def mark_upsell_rejected(call_id: str, item_id: str, category: str = "unknown"):
     """
     Mark upsell as rejected.
     
     Args:
         call_id: Call identifier
         item_id: Item identifier
+        category: Item category
     """
     tracker = _get_tracker(call_id)
-    tracker.mark_rejected(item_id)
+    tracker.mark_rejected(item_id, category)
 
 
 def customer_declined_all_upsells(call_id: str):
@@ -775,7 +889,7 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    print("Upsell Module (Enterprise v2.0)")
+    print("Upsell Module (Enterprise v2.1)")
     print("=" * 50)
     
     # Sample menu
@@ -803,8 +917,17 @@ if __name__ == "__main__":
     print(f"Current order: {sample_order['items'][0]['name']}")
     print(f"Total: ${sample_order['total']:.2f}")
     
+    # Set phase
+    set_upsell_phase(call_id, UpsellPhase.ORDER_BUILDING)
+    
     # Generate suggestions
-    suggestions = suggest_upsells(call_id, sample_menu, sample_order, max_suggestions=2)
+    suggestions = suggest_upsells(
+        call_id, 
+        sample_menu, 
+        sample_order, 
+        max_suggestions=2,
+        trigger=UpsellTrigger.ITEM_ADDED
+    )
     
     print(f"\nUpsell suggestions ({len(suggestions)}):")
     for sug in suggestions:
@@ -816,10 +939,16 @@ if __name__ == "__main__":
     
     # Mark one accepted
     if suggestions:
-        mark_upsell_accepted(call_id, suggestions[0]["item_id"])
+        mark_upsell_accepted(call_id, suggestions[0]["item_id"], suggestions[0]["price"], suggestions[0].get("category", "unknown"))
     
     # Try again (should get different suggestions)
-    suggestions2 = suggest_upsells(call_id, sample_menu, sample_order, max_suggestions=2)
+    suggestions2 = suggest_upsells(
+        call_id, 
+        sample_menu, 
+        sample_order, 
+        max_suggestions=2,
+        trigger=UpsellTrigger.CATEGORY_MISSING
+    )
     print(f"\nSecond round ({len(suggestions2)}):")
     for sug in suggestions2:
         print(f"  - {sug['name']} (${sug['price']:.2f})")
@@ -830,6 +959,8 @@ if __name__ == "__main__":
     print(f"  Total offered: {stats['total_offered']}")
     print(f"  Total accepted: {stats['total_accepted']}")
     print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
+    print(f"  Revenue: ${stats['revenue_from_upsells']:.2f}")
+    print(f"  Phase: {stats['current_phase']}")
     
     print("\n" + "=" * 50)
     print("Production upsell module ready")
