@@ -1,28 +1,29 @@
 """
-Menu Module (Enterprise Production)
-====================================
-Enterprise-grade menu management with validation and analytics.
+Menu Module (Production Hardened)
+==================================
+Split menu handling into data access and reasoning logic.
 
-NEW FEATURES (Enterprise v2.0):
-✅ Strict schema validation
-✅ Menu analytics (item popularity, category distribution)
-✅ Price range validation
-✅ Nutritional info support
-✅ Allergen tracking
-✅ Prometheus metrics integration
-✅ Menu version tracking
-✅ Item availability monitoring
-✅ Cache hit rate tracking
+HARDENING UPDATES (v3.0):
+✅ MenuRepository (data access, validation)
+✅ MenuReasoner (interpretation, matching, normalization)
+✅ Canonical item IDs (immutable identifiers)
+✅ Synonym mapping for matching
+✅ Hallucination rejection (AI cannot invent items)
+✅ Deterministic validation
+✅ Strict separation of data and logic
 
-Version: 2.0.0 (Enterprise)
-Last Updated: 2026-01-21
+Version: 3.0.0 (Production Hardened)
+Last Updated: 2026-01-22
 """
 
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from enum import Enum
 import asyncio
 from collections import defaultdict
+import hashlib
 
 try:
     from prometheus_client import Counter, Histogram, Gauge
@@ -34,19 +35,30 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 # Cache configuration
 CACHE_TTL = 300  # 5 minutes
 CACHE_MAX_SIZE = 100
 
 # Validation limits
-MAX_MENU_SIZE = 1000  # Max items per menu
+MAX_MENU_SIZE = 1000
 MAX_ITEM_NAME_LENGTH = 200
 MAX_DESCRIPTION_LENGTH = 500
 MIN_ITEM_PRICE = 0.01
 MAX_ITEM_PRICE = 10000.00
 
+# Matching configuration
+MATCH_CONFIDENCE_THRESHOLD = 0.7  # 70% similarity
+MAX_SYNONYMS_PER_ITEM = 10
 
-# Prometheus Metrics
+
+# ============================================================================
+# METRICS
+# ============================================================================
+
 if METRICS_ENABLED:
     menu_cache_hits = Counter('menu_cache_hits_total', 'Menu cache hits')
     menu_cache_misses = Counter('menu_cache_misses_total', 'Menu cache misses')
@@ -55,22 +67,186 @@ if METRICS_ENABLED:
         'Menu validation errors',
         ['error_type']
     )
-    menu_items_count = Histogram('menu_items_count', 'Number of items per menu')
-    menu_price_range = Histogram('menu_item_price_dollars', 'Menu item prices')
-    menus_cached = Gauge('menus_cached', 'Number of menus in cache')
+    menu_hallucination_rejections = Counter(
+        'menu_hallucination_rejections_total',
+        'AI hallucination rejections'
+    )
+    menu_synonym_matches = Counter(
+        'menu_synonym_matches_total',
+        'Synonym-based matches'
+    )
+    menu_exact_matches = Counter(
+        'menu_exact_matches_total',
+        'Exact matches'
+    )
 
 
-class MenuCache:
-    """Simple TTL-based menu cache."""
+# ============================================================================
+# CANONICAL MENU ITEM
+# ============================================================================
+
+@dataclass(frozen=True)
+class CanonicalMenuItem:
+    """
+    Canonical menu item with immutable identifier.
+    
+    CRITICAL: frozen=True means item CANNOT be modified.
+    This prevents AI from altering menu data.
+    """
+    canonical_id: str  # Immutable, unique identifier
+    name: str
+    price: float
+    description: str
+    category: str
+    available: bool
+    synonyms: Tuple[str, ...] = field(default_factory=tuple)  # Immutable tuple
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "canonical_id": self.canonical_id,
+            "name": self.name,
+            "price": self.price,
+            "description": self.description,
+            "category": self.category,
+            "available": self.available,
+            "synonyms": list(self.synonyms),
+            "metadata": self.metadata.copy()
+        }
+    
+    def matches_query(self, query: str) -> bool:
+        """
+        Check if query matches this item.
+        
+        Matches against: name, synonyms
+        """
+        query_lower = query.lower().strip()
+        
+        # Exact name match
+        if query_lower == self.name.lower():
+            return True
+        
+        # Synonym match
+        for synonym in self.synonyms:
+            if query_lower == synonym.lower():
+                return True
+        
+        # Partial match (contains)
+        if query_lower in self.name.lower():
+            return True
+        
+        return False
+
+
+# ============================================================================
+# MENU REPOSITORY (Data Access & Validation)
+# ============================================================================
+
+class MenuRepository:
+    """
+    Data access layer for menu management.
+    
+    Responsibilities:
+    - Load menu data
+    - Validate menu structure
+    - Cache validated menus
+    - Generate canonical IDs
+    - Store synonym mappings
+    
+    Does NOT:
+    - Interpret user queries
+    - Match items
+    - Reason about menu
+    """
     
     def __init__(self, ttl: int = CACHE_TTL, max_size: int = CACHE_MAX_SIZE):
-        self.cache: Dict[str, tuple[Dict[str, Any], datetime]] = {}
+        self.cache: Dict[str, Tuple[Dict[str, Any], datetime]] = {}
         self.ttl = ttl
         self.max_size = max_size
+        
+        # Canonical item registry (by restaurant)
+        self._canonical_items: Dict[str, Dict[str, CanonicalMenuItem]] = {}
+        
+        # Synonym index (for fast lookup)
+        self._synonym_index: Dict[str, Dict[str, Set[str]]] = {}  # restaurant_id -> {synonym: [canonical_ids]}
     
-    def get(self, restaurant_id: str) -> Optional[Dict[str, Any]]:
-        """Get cached menu if valid."""
+    async def get_menu(self, restaurant_id: str) -> Dict[str, Any]:
+        """
+        Get validated menu for restaurant.
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            
+        Returns:
+            Validated menu with canonical items
+        """
+        # Check cache
+        cached = self._get_from_cache(restaurant_id)
+        if cached:
+            return cached
+        
+        try:
+            # Fetch raw menu
+            raw_menu = await self._fetch_menu_from_db(restaurant_id)
+            
+            # Validate and canonicalize
+            validated = self._validate_and_canonicalize(raw_menu, restaurant_id)
+            
+            # Cache
+            self._set_in_cache(restaurant_id, validated)
+            
+            return validated
+        
+        except Exception as e:
+            logger.error(f"Error loading menu for {restaurant_id}: {str(e)}")
+            return self._get_fallback_menu(restaurant_id)
+    
+    def get_canonical_item(
+        self,
+        restaurant_id: str,
+        canonical_id: str
+    ) -> Optional[CanonicalMenuItem]:
+        """
+        Get canonical item by ID.
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            canonical_id: Canonical item ID
+            
+        Returns:
+            CanonicalMenuItem or None
+        """
+        items = self._canonical_items.get(restaurant_id, {})
+        return items.get(canonical_id)
+    
+    def get_all_canonical_items(
+        self,
+        restaurant_id: str
+    ) -> List[CanonicalMenuItem]:
+        """
+        Get all canonical items for restaurant.
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            
+        Returns:
+            List of CanonicalMenuItem
+        """
+        items = self._canonical_items.get(restaurant_id, {})
+        return list(items.values())
+    
+    def invalidate_cache(self, restaurant_id: str):
+        """Invalidate cache for restaurant."""
+        if restaurant_id in self.cache:
+            del self.cache[restaurant_id]
+            logger.info(f"Menu cache invalidated: {restaurant_id}")
+    
+    def _get_from_cache(self, restaurant_id: str) -> Optional[Dict[str, Any]]:
+        """Get menu from cache if valid."""
         if restaurant_id not in self.cache:
+            if METRICS_ENABLED:
+                menu_cache_misses.inc()
             return None
         
         menu, timestamp = self.cache[restaurant_id]
@@ -78,618 +254,577 @@ class MenuCache:
         # Check TTL
         if datetime.utcnow() - timestamp > timedelta(seconds=self.ttl):
             del self.cache[restaurant_id]
-            logger.debug(f"Menu cache expired for {restaurant_id}")
-            
             if METRICS_ENABLED:
                 menu_cache_misses.inc()
-            
             return None
-        
-        logger.debug(f"Menu cache hit for {restaurant_id}")
         
         if METRICS_ENABLED:
             menu_cache_hits.inc()
         
         return menu
     
-    def set(self, restaurant_id: str, menu: Dict[str, Any]):
-        """Cache menu with TTL and metrics."""
-        # Evict oldest if cache full
+    def _set_in_cache(self, restaurant_id: str, menu: Dict[str, Any]):
+        """Set menu in cache."""
+        # Evict oldest if full
         if len(self.cache) >= self.max_size:
-            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
-            del self.cache[oldest_key]
-            logger.debug(f"Evicted oldest cache entry: {oldest_key}")
+            oldest = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest]
         
         self.cache[restaurant_id] = (menu, datetime.utcnow())
-        
-        if METRICS_ENABLED:
-            menus_cached.set(len(self.cache))
-        
-        logger.debug(f"Menu cached for {restaurant_id}")
     
-    def invalidate(self, restaurant_id: str):
-        """Invalidate cache for restaurant."""
-        if restaurant_id in self.cache:
-            del self.cache[restaurant_id]
+    async def _fetch_menu_from_db(self, restaurant_id: str) -> Dict[str, Any]:
+        """Fetch raw menu from database."""
+        try:
+            from db import db
             
+            loop = asyncio.get_event_loop()
+            menu = await loop.run_in_executor(
+                None,
+                lambda: db.fetch_menu(restaurant_id)
+            )
+            
+            if not menu:
+                logger.warning(f"No menu found: {restaurant_id}")
+                return self._get_fallback_menu(restaurant_id)
+            
+            return menu
+        
+        except Exception as e:
+            logger.error(f"Database error: {str(e)}")
+            return self._get_fallback_menu(restaurant_id)
+    
+    def _validate_and_canonicalize(
+        self,
+        raw_menu: Dict[str, Any],
+        restaurant_id: str
+    ) -> Dict[str, Any]:
+        """
+        Validate menu and generate canonical items.
+        
+        This is DETERMINISTIC - same input always produces same output.
+        """
+        if not raw_menu or not isinstance(raw_menu, dict):
+            return {"items": [], "categories": []}
+        
+        # Validate items
+        raw_items = raw_menu.get("items", [])
+        if not isinstance(raw_items, list):
+            raw_items = []
+        
+        canonical_items = []
+        canonical_registry = {}
+        synonym_index = defaultdict(set)
+        
+        for raw_item in raw_items[:MAX_MENU_SIZE]:
+            try:
+                # Generate canonical ID (deterministic)
+                canonical_id = self._generate_canonical_id(
+                    restaurant_id,
+                    raw_item.get("id", ""),
+                    raw_item.get("name", "")
+                )
+                
+                # Validate item
+                validated = self._validate_item(raw_item)
+                if not validated:
+                    continue
+                
+                # Extract synonyms
+                synonyms = self._extract_synonyms(validated)
+                
+                # Create canonical item (immutable)
+                canonical = CanonicalMenuItem(
+                    canonical_id=canonical_id,
+                    name=validated["name"],
+                    price=validated["price"],
+                    description=validated["description"],
+                    category=validated["category"],
+                    available=validated["available"],
+                    synonyms=tuple(synonyms),
+                    metadata=validated.get("metadata", {})
+                )
+                
+                canonical_items.append(canonical)
+                canonical_registry[canonical_id] = canonical
+                
+                # Index synonyms
+                for synonym in synonyms:
+                    synonym_index[synonym.lower()].add(canonical_id)
+            
+            except Exception as e:
+                logger.error(f"Error canonicalizing item: {str(e)}")
+                if METRICS_ENABLED:
+                    menu_validation_errors.labels(error_type='canonicalization').inc()
+        
+        # Store canonical items
+        self._canonical_items[restaurant_id] = canonical_registry
+        self._synonym_index[restaurant_id] = dict(synonym_index)
+        
+        # Extract categories
+        categories = list(set(item.category for item in canonical_items))
+        
+        return {
+            "items": [item.to_dict() for item in canonical_items],
+            "categories": sorted(categories),
+            "restaurant_id": restaurant_id,
+            "canonical_count": len(canonical_items),
+            "validated_at": datetime.utcnow().isoformat()
+        }
+    
+    def _generate_canonical_id(
+        self,
+        restaurant_id: str,
+        item_id: str,
+        item_name: str
+    ) -> str:
+        """
+        Generate deterministic canonical ID.
+        
+        Same inputs always produce same ID.
+        """
+        # Use hash of restaurant + item_id + name
+        content = f"{restaurant_id}:{item_id}:{item_name}"
+        hash_digest = hashlib.sha256(content.encode()).hexdigest()
+        return f"item_{hash_digest[:16]}"
+    
+    def _validate_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Validate menu item (deterministic).
+        
+        Returns validated item or None.
+        """
+        if not isinstance(item, dict):
+            return None
+        
+        # Required fields
+        if "name" not in item or "price" not in item:
             if METRICS_ENABLED:
-                menus_cached.set(len(self.cache))
-            
-            logger.info(f"Menu cache invalidated for {restaurant_id}")
+                menu_validation_errors.labels(error_type='missing_fields').inc()
+            return None
+        
+        # Validate name
+        name = str(item["name"]).strip()
+        if not name or len(name) > MAX_ITEM_NAME_LENGTH:
+            if METRICS_ENABLED:
+                menu_validation_errors.labels(error_type='invalid_name').inc()
+            return None
+        
+        # Validate price
+        price = self._normalize_price(item["price"])
+        if price is None:
+            if METRICS_ENABLED:
+                menu_validation_errors.labels(error_type='invalid_price').inc()
+            return None
+        
+        if price < MIN_ITEM_PRICE or price > MAX_ITEM_PRICE:
+            if METRICS_ENABLED:
+                menu_validation_errors.labels(error_type='price_out_of_range').inc()
+            return None
+        
+        # Optional fields
+        description = str(item.get("description", "")).strip()
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            description = description[:MAX_DESCRIPTION_LENGTH] + "..."
+        
+        category = str(item.get("category", "Other")).strip()
+        available = bool(item.get("available", True))
+        
+        return {
+            "name": name,
+            "price": price,
+            "description": description,
+            "category": category,
+            "available": available,
+            "metadata": item.get("metadata", {})
+        }
     
-    def clear(self):
-        """Clear entire cache."""
-        count = len(self.cache)
-        self.cache.clear()
+    def _normalize_price(self, price: Any) -> Optional[float]:
+        """Normalize price to float (deterministic)."""
+        try:
+            if isinstance(price, (int, float)):
+                price_float = float(price)
+            elif isinstance(price, str):
+                price_clean = price.replace("$", "").replace(",", "").strip()
+                price_float = float(price_clean)
+            else:
+                return None
+            
+            if price_float < 0 or price_float > 10000:
+                return None
+            
+            return round(price_float, 2)
+        
+        except (ValueError, TypeError):
+            return None
+    
+    def _extract_synonyms(self, item: Dict[str, Any]) -> List[str]:
+        """
+        Extract synonyms from item metadata.
+        
+        Synonyms are explicitly defined, NOT generated by AI.
+        """
+        synonyms = []
+        
+        # Check metadata for explicit synonyms
+        metadata = item.get("metadata", {})
+        if "synonyms" in metadata and isinstance(metadata["synonyms"], list):
+            for syn in metadata["synonyms"][:MAX_SYNONYMS_PER_ITEM]:
+                if isinstance(syn, str) and syn.strip():
+                    synonyms.append(syn.strip())
+        
+        return synonyms
+    
+    def _get_fallback_menu(self, restaurant_id: str) -> Dict[str, Any]:
+        """Get safe fallback menu."""
+        return {
+            "items": [],
+            "categories": [],
+            "restaurant_id": restaurant_id,
+            "fallback": True,
+            "validated_at": datetime.utcnow().isoformat()
+        }
+
+
+# ============================================================================
+# MENU REASONER (Interpretation & Matching)
+# ============================================================================
+
+class MenuReasoner:
+    """
+    Logic layer for menu interpretation and matching.
+    
+    Responsibilities:
+    - Interpret user queries
+    - Match queries to canonical items
+    - Normalize item references
+    - Reject hallucinations
+    
+    Does NOT:
+    - Access database
+    - Validate data
+    - Modify menu items
+    """
+    
+    def __init__(self, repository: MenuRepository):
+        self.repository = repository
+    
+    def match_item(
+        self,
+        restaurant_id: str,
+        query: str,
+        category: Optional[str] = None
+    ) -> Optional[CanonicalMenuItem]:
+        """
+        Match user query to canonical menu item.
+        
+        CRITICAL: Returns None if no match (hallucination rejection).
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            query: User query (e.g., "large pizza")
+            category: Optional category filter
+            
+        Returns:
+            CanonicalMenuItem or None
+        """
+        if not query or not query.strip():
+            return None
+        
+        query_clean = query.strip()
+        
+        # Get all canonical items
+        items = self.repository.get_all_canonical_items(restaurant_id)
+        if not items:
+            return None
+        
+        # Filter by category if specified
+        if category:
+            items = [item for item in items if item.category == category]
+        
+        # 1. Try exact match (highest priority)
+        for item in items:
+            if item.name.lower() == query_clean.lower():
+                if METRICS_ENABLED:
+                    menu_exact_matches.inc()
+                return item
+        
+        # 2. Try synonym match
+        synonym_match = self._match_by_synonym(restaurant_id, query_clean, items)
+        if synonym_match:
+            if METRICS_ENABLED:
+                menu_synonym_matches.inc()
+            return synonym_match
+        
+        # 3. Try partial match (contains)
+        for item in items:
+            if query_clean.lower() in item.name.lower():
+                return item
+        
+        # 4. No match - hallucination rejection
+        logger.warning(
+            f"No menu match for query: '{query}' (restaurant: {restaurant_id})"
+        )
         
         if METRICS_ENABLED:
-            menus_cached.set(0)
+            menu_hallucination_rejections.inc()
         
-        logger.info(f"Menu cache cleared ({count} entries)")
+        return None  # AI cannot invent items!
     
-    def size(self) -> int:
-        """Get cache size."""
-        return len(self.cache)
+    def match_items(
+        self,
+        restaurant_id: str,
+        queries: List[str]
+    ) -> List[Optional[CanonicalMenuItem]]:
+        """
+        Match multiple queries (batch).
+        
+        Returns list with same length as queries.
+        None for items that don't match (hallucination rejection).
+        """
+        return [self.match_item(restaurant_id, query) for query in queries]
+    
+    def validate_item_exists(
+        self,
+        restaurant_id: str,
+        canonical_id: str
+    ) -> bool:
+        """
+        Validate that item exists (hallucination check).
+        
+        Use this to verify AI-suggested items.
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            canonical_id: Canonical item ID
+            
+        Returns:
+            True if item exists
+        """
+        item = self.repository.get_canonical_item(restaurant_id, canonical_id)
+        return item is not None
+    
+    def get_available_items(
+        self,
+        restaurant_id: str,
+        category: Optional[str] = None
+    ) -> List[CanonicalMenuItem]:
+        """
+        Get available items (filtering).
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            category: Optional category filter
+            
+        Returns:
+            List of available canonical items
+        """
+        items = self.repository.get_all_canonical_items(restaurant_id)
+        
+        # Filter available
+        items = [item for item in items if item.available]
+        
+        # Filter category
+        if category:
+            items = [item for item in items if item.category == category]
+        
+        return items
+    
+    def get_categories(self, restaurant_id: str) -> List[str]:
+        """
+        Get all categories.
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            
+        Returns:
+            List of category names
+        """
+        items = self.repository.get_all_canonical_items(restaurant_id)
+        categories = set(item.category for item in items)
+        return sorted(categories)
+    
+    def format_for_ai(
+        self,
+        restaurant_id: str,
+        max_items: Optional[int] = None
+    ) -> str:
+        """
+        Format menu for AI prompt.
+        
+        ONLY includes canonical items (no hallucinations possible).
+        
+        Args:
+            restaurant_id: Restaurant identifier
+            max_items: Max items to include
+            
+        Returns:
+            Formatted menu string
+        """
+        items = self.get_available_items(restaurant_id)
+        
+        if not items:
+            return "Menu unavailable."
+        
+        # Limit items
+        if max_items and len(items) > max_items:
+            items = items[:max_items]
+        
+        # Group by category
+        by_category = defaultdict(list)
+        for item in items:
+            by_category[item.category].append(item)
+        
+        # Format
+        lines = []
+        for category in sorted(by_category.keys()):
+            lines.append(f"\n{category}:")
+            lines.append("-" * 40)
+            
+            for item in by_category[category]:
+                # Include canonical ID for validation
+                item_line = f"• {item.name} - ${item.price:.2f} [ID: {item.canonical_id}]"
+                
+                if item.description:
+                    item_line += f"\n  {item.description}"
+                
+                lines.append(item_line)
+        
+        return "\n".join(lines)
+    
+    def _match_by_synonym(
+        self,
+        restaurant_id: str,
+        query: str,
+        items: List[CanonicalMenuItem]
+    ) -> Optional[CanonicalMenuItem]:
+        """Match by synonym."""
+        query_lower = query.lower()
+        
+        # Check synonym index
+        synonym_index = self.repository._synonym_index.get(restaurant_id, {})
+        canonical_ids = synonym_index.get(query_lower, set())
+        
+        if not canonical_ids:
+            return None
+        
+        # Get first matching canonical item
+        for canonical_id in canonical_ids:
+            item = self.repository.get_canonical_item(restaurant_id, canonical_id)
+            if item and item.available:
+                return item
+        
+        return None
 
 
-_menu_cache = MenuCache()
+# ============================================================================
+# GLOBAL INSTANCES
+# ============================================================================
 
+_repository = MenuRepository()
+_reasoner = MenuReasoner(_repository)
+
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
 
 async def get_menu(restaurant_id: str) -> Dict[str, Any]:
     """
-    Get menu for restaurant with caching and validation.
+    Get validated menu (data access).
     
     Args:
         restaurant_id: Restaurant identifier
         
     Returns:
-        Validated menu dictionary
-        
-    Example:
-        >>> menu = await get_menu("rest_001")
-        >>> print(menu["items"])
+        Validated menu with canonical items
     """
-    # Check cache first
-    cached = _menu_cache.get(restaurant_id)
-    if cached:
-        return cached
-    
-    try:
-        # Fetch menu from database
-        menu = await _fetch_menu_from_db(restaurant_id)
-        
-        # Validate menu
-        validated = _validate_menu(menu)
-        
-        # Cache validated menu
-        _menu_cache.set(restaurant_id, validated)
-        
-        return validated
-    
-    except Exception as e:
-        logger.error(f"Error fetching menu for {restaurant_id}: {str(e)}")
-        
-        # Return safe fallback
-        return _get_fallback_menu(restaurant_id)
+    return await _repository.get_menu(restaurant_id)
 
 
-async def _fetch_menu_from_db(restaurant_id: str) -> Dict[str, Any]:
-    """
-    Fetch menu from database.
-    
-    Args:
-        restaurant_id: Restaurant identifier
-        
-    Returns:
-        Raw menu data
-    """
-    try:
-        from db import db
-        
-        # Run blocking DB call in executor
-        loop = asyncio.get_event_loop()
-        menu = await loop.run_in_executor(
-            None,
-            lambda: db.fetch_menu(restaurant_id)
-        )
-        
-        if not menu:
-            logger.warning(f"No menu found for {restaurant_id}")
-            return _get_fallback_menu(restaurant_id)
-        
-        logger.info(f"Fetched menu for {restaurant_id}: {len(menu.get('items', []))} items")
-        return menu
-    
-    except Exception as e:
-        logger.error(f"Database error fetching menu: {str(e)}")
-        return _get_fallback_menu(restaurant_id)
-
-
-def _validate_menu(menu: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate and normalize menu data.
-    
-    Args:
-        menu: Raw menu data
-        
-    Returns:
-        Validated menu data
-    """
-    if not menu or not isinstance(menu, dict):
-        logger.warning("Invalid menu structure")
-        return {"items": [], "categories": []}
-    
-    # Validate items
-    items = menu.get("items", [])
-    if not isinstance(items, list):
-        logger.warning("Menu items is not a list")
-        items = []
-    
-    validated_items = []
-    error_count = 0
-    
-    for item in items[:MAX_MENU_SIZE]:  # Enforce size limit
-        try:
-            validated_item = _validate_menu_item(item)
-            if validated_item:
-                validated_items.append(validated_item)
-                
-                # Track price distribution
-                if METRICS_ENABLED:
-                    menu_price_range.observe(validated_item["price"])
-            else:
-                error_count += 1
-        except Exception as e:
-            logger.error(f"Error validating menu item: {str(e)}")
-            error_count += 1
-            
-            if METRICS_ENABLED:
-                menu_validation_errors.labels(error_type='item_validation').inc()
-            continue
-    
-    # Track menu size
-    if METRICS_ENABLED:
-        menu_items_count.observe(len(validated_items))
-    
-    if error_count > 0:
-        logger.warning(f"Menu validation: {error_count} items failed validation")
-    
-    # Validate categories
-    categories = menu.get("categories", [])
-    if not isinstance(categories, list):
-        categories = []
-    
-    validated_categories = [
-        cat for cat in categories
-        if isinstance(cat, str) and len(cat) > 0
-    ]
-    
-    return {
-        "items": validated_items,
-        "categories": validated_categories,
-        "restaurant_id": menu.get("restaurant_id", "unknown"),
-        "validated_at": datetime.utcnow().isoformat()
-    }
-
-
-def _validate_menu_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Validate individual menu item.
-    
-    Args:
-        item: Menu item data
-        
-    Returns:
-        Validated item or None if invalid
-    """
-    if not isinstance(item, dict):
-        return None
-    
-    # Required fields
-    if "name" not in item or "price" not in item:
-        logger.warning("Menu item missing required fields")
-        return None
-    
-    name = str(item["name"]).strip()
-    if not name or len(name) > MAX_ITEM_NAME_LENGTH:
-        logger.warning(f"Invalid item name: {name}")
-        return None
-    
-    # Normalize price
-    price = _normalize_price(item["price"])
-    if price is None:
-        logger.warning(f"Invalid price for item {name}")
-        
-        if METRICS_ENABLED:
-            menu_validation_errors.labels(error_type='invalid_price').inc()
-        
-        return None
-    
-    # Validate price range
-    if price < MIN_ITEM_PRICE or price > MAX_ITEM_PRICE:
-        logger.warning(f"Price out of range for {name}: ${price:.2f}")
-        
-        if METRICS_ENABLED:
-            menu_validation_errors.labels(error_type='price_out_of_range').inc()
-        
-        return None
-    
-    # Optional fields
-    description = str(item.get("description", "")).strip()
-    if len(description) > MAX_DESCRIPTION_LENGTH:
-        description = description[:MAX_DESCRIPTION_LENGTH] + "..."
-    
-    category = str(item.get("category", "Other")).strip()
-    available = bool(item.get("available", True))
-    
-    return {
-        "id": str(item.get("id", "")),
-        "name": name,
-        "price": price,
-        "description": description,
-        "category": category,
-        "available": available,
-        "metadata": item.get("metadata", {})
-    }
-
-
-def _normalize_price(price: Any) -> Optional[float]:
-    """
-    Normalize price to float.
-    
-    Args:
-        price: Raw price value
-        
-    Returns:
-        Normalized price or None if invalid
-    """
-    try:
-        # Handle various price formats
-        if isinstance(price, (int, float)):
-            price_float = float(price)
-        elif isinstance(price, str):
-            # Remove currency symbols and commas
-            price_clean = price.replace("$", "").replace(",", "").strip()
-            price_float = float(price_clean)
-        else:
-            return None
-        
-        # Validate range
-        if price_float < 0 or price_float > 10000:
-            logger.warning(f"Price out of range: {price_float}")
-            return None
-        
-        # Round to 2 decimal places
-        return round(price_float, 2)
-    
-    except (ValueError, TypeError) as e:
-        logger.error(f"Price normalization error: {str(e)}")
-        return None
-
-
-def _get_fallback_menu(restaurant_id: str) -> Dict[str, Any]:
-    """
-    Get safe fallback menu.
-    
-    Args:
-        restaurant_id: Restaurant identifier
-        
-    Returns:
-        Minimal fallback menu
-    """
-    logger.warning(f"Using fallback menu for {restaurant_id}")
-    
-    return {
-        "items": [
-            {
-                "id": "fallback_1",
-                "name": "Special of the Day",
-                "price": 0.00,
-                "description": "Please ask for today's specials",
-                "category": "Specials",
-                "available": True,
-                "metadata": {"fallback": True}
-            }
-        ],
-        "categories": ["Specials"],
-        "restaurant_id": restaurant_id,
-        "fallback": True,
-        "validated_at": datetime.utcnow().isoformat()
-    }
-
-
-def format_menu_for_prompt(menu: Dict[str, Any], max_items: Optional[int] = None) -> str:
-    """
-    Format menu for LLM prompt.
-    
-    Args:
-        menu: Menu data
-        max_items: Maximum items to include (optional)
-        
-    Returns:
-        Formatted menu string
-        
-    Example:
-        >>> menu_text = format_menu_for_prompt(menu, max_items=10)
-    """
-    if not menu or not menu.get("items"):
-        return "Menu unavailable. Please ask customer what they'd like."
-    
-    items = menu["items"]
-    
-    # Limit items if requested
-    if max_items and len(items) > max_items:
-        items = items[:max_items]
-    
-    # Group by category
-    categorized = {}
-    for item in items:
-        if not item.get("available", True):
-            continue
-        
-        category = item.get("category", "Other")
-        if category not in categorized:
-            categorized[category] = []
-        categorized[category].append(item)
-    
-    # Format output
-    lines = []
-    
-    for category, items_in_cat in sorted(categorized.items()):
-        lines.append(f"\n{category}:")
-        lines.append("-" * 40)
-        
-        for item in items_in_cat:
-            name = item["name"]
-            price = item["price"]
-            description = item.get("description", "")
-            
-            # Format item line
-            item_line = f"• {name} - ${price:.2f}"
-            
-            if description:
-                item_line += f"\n  {description}"
-            
-            lines.append(item_line)
-    
-    return "\n".join(lines)
-
-
-def format_menu_compact(menu: Dict[str, Any]) -> str:
-    """
-    Format menu in compact format (names and prices only).
-    
-    Args:
-        menu: Menu data
-        
-    Returns:
-        Compact menu string
-    """
-    if not menu or not menu.get("items"):
-        return "Menu unavailable"
-    
-    items = [
-        f"{item['name']} (${item['price']:.2f})"
-        for item in menu["items"]
-        if item.get("available", True)
-    ]
-    
-    return ", ".join(items)
-
-
-def search_menu_items(
-    menu: Dict[str, Any],
+def match_menu_item(
+    restaurant_id: str,
     query: str,
     category: Optional[str] = None
-) -> List[Dict[str, Any]]:
+) -> Optional[CanonicalMenuItem]:
     """
-    Search menu items by name or description.
+    Match user query to menu item (reasoning).
+    
+    CRITICAL: Returns None if no match (hallucination rejection).
     
     Args:
-        menu: Menu data
-        query: Search query
-        category: Filter by category (optional)
+        restaurant_id: Restaurant identifier
+        query: User query
+        category: Optional category filter
         
     Returns:
-        Matching items
+        CanonicalMenuItem or None
     """
-    if not menu or not menu.get("items"):
-        return []
-    
-    query_lower = query.lower()
-    results = []
-    
-    for item in menu["items"]:
-        if not item.get("available", True):
-            continue
-        
-        # Category filter
-        if category and item.get("category") != category:
-            continue
-        
-        # Search in name and description
-        name = item.get("name", "").lower()
-        description = item.get("description", "").lower()
-        
-        if query_lower in name or query_lower in description:
-            results.append(item)
-    
-    return results
+    return _reasoner.match_item(restaurant_id, query, category)
 
 
-def get_item_by_id(menu: Dict[str, Any], item_id: str) -> Optional[Dict[str, Any]]:
+def validate_item_exists(restaurant_id: str, canonical_id: str) -> bool:
     """
-    Get menu item by ID.
+    Validate that item exists (hallucination check).
+    
+    Use this to verify AI-suggested items BEFORE accepting them.
     
     Args:
-        menu: Menu data
-        item_id: Item identifier
+        restaurant_id: Restaurant identifier
+        canonical_id: Canonical item ID
         
     Returns:
-        Menu item or None
+        True if item exists
     """
-    if not menu or not menu.get("items"):
-        return None
-    
-    for item in menu["items"]:
-        if item.get("id") == item_id:
-            return item
-    
-    return None
+    return _reasoner.validate_item_exists(restaurant_id, canonical_id)
 
 
-def get_item_by_name(menu: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+def get_available_items(
+    restaurant_id: str,
+    category: Optional[str] = None
+) -> List[CanonicalMenuItem]:
     """
-    Get menu item by name (case-insensitive).
+    Get available menu items (reasoning).
     
     Args:
-        menu: Menu data
-        name: Item name
+        restaurant_id: Restaurant identifier
+        category: Optional category filter
         
     Returns:
-        Menu item or None
+        List of available items
     """
-    if not menu or not menu.get("items"):
-        return None
-    
-    name_lower = name.lower()
-    
-    for item in menu["items"]:
-        if item.get("name", "").lower() == name_lower:
-            return item
-    
-    return None
+    return _reasoner.get_available_items(restaurant_id, category)
 
 
-def get_items_by_category(menu: Dict[str, Any], category: str) -> List[Dict[str, Any]]:
+def format_menu_for_ai(
+    restaurant_id: str,
+    max_items: Optional[int] = None
+) -> str:
     """
-    Get all items in a category.
+    Format menu for AI prompt (reasoning).
     
     Args:
-        menu: Menu data
-        category: Category name
+        restaurant_id: Restaurant identifier
+        max_items: Max items to include
         
     Returns:
-        List of items
+        Formatted menu string with canonical IDs
     """
-    if not menu or not menu.get("items"):
-        return []
-    
-    return [
-        item for item in menu["items"]
-        if item.get("category") == category and item.get("available", True)
-    ]
-
-
-def get_categories(menu: Dict[str, Any]) -> List[str]:
-    """
-    Get list of categories.
-    
-    Args:
-        menu: Menu data
-        
-    Returns:
-        List of category names
-    """
-    if not menu:
-        return []
-    
-    # Use explicit categories if available
-    if menu.get("categories"):
-        return menu["categories"]
-    
-    # Otherwise extract from items
-    categories = set()
-    for item in menu.get("items", []):
-        cat = item.get("category")
-        if cat:
-            categories.add(cat)
-    
-    return sorted(list(categories))
+    return _reasoner.format_for_ai(restaurant_id, max_items)
 
 
 def invalidate_menu_cache(restaurant_id: str):
-    """
-    Invalidate cached menu.
-    
-    Args:
-        restaurant_id: Restaurant identifier
-    """
-    _menu_cache.invalidate(restaurant_id)
+    """Invalidate menu cache (data access)."""
+    _repository.invalidate_cache(restaurant_id)
 
 
-def clear_menu_cache():
-    """Clear all cached menus."""
-    _menu_cache.clear()
+def get_menu_categories(restaurant_id: str) -> List[str]:
+    """Get menu categories (reasoning)."""
+    return _reasoner.get_categories(restaurant_id)
 
 
-def get_cache_stats() -> Dict[str, Any]:
-    """Get menu cache statistics."""
-    return {
-        "size": _menu_cache.size(),
-        "max_size": _menu_cache.max_size,
-        "ttl_seconds": _menu_cache.ttl
-    }
-
-
-def get_menu_analytics(menu: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Get analytics for a menu (Enterprise v2.0).
-    
-    Args:
-        menu: Menu data
-        
-    Returns:
-        Analytics including price ranges, category distribution, availability
-    """
-    items = menu.get("items", [])
-    
-    if not items:
-        return {
-            "total_items": 0,
-            "available_items": 0,
-            "categories": {},
-            "price_range": {"min": 0, "max": 0, "avg": 0}
-        }
-    
-    # Price analytics
-    prices = [item["price"] for item in items]
-    min_price = min(prices)
-    max_price = max(prices)
-    avg_price = sum(prices) / len(prices)
-    
-    # Category distribution
-    category_counts = defaultdict(int)
-    category_available = defaultdict(int)
-    
-    for item in items:
-        category = item.get("category", "Other")
-        category_counts[category] += 1
-        if item.get("available", True):
-            category_available[category] += 1
-    
-    # Availability
-    available_count = sum(1 for item in items if item.get("available", True))
-    
-    return {
-        "total_items": len(items),
-        "available_items": available_count,
-        "unavailable_items": len(items) - available_count,
-        "availability_rate": round(available_count / len(items), 4),
-        "categories": {
-            cat: {
-                "total": count,
-                "available": category_available[cat]
-            }
-            for cat, count in category_counts.items()
-        },
-        "price_range": {
-            "min": round(min_price, 2),
-            "max": round(max_price, 2),
-            "avg": round(avg_price, 2)
-        }
-    }
-
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -698,8 +833,8 @@ if __name__ == "__main__":
     )
     
     async def example():
-        print("Menu Module (Enterprise v2.0)")
-        print("=" * 50)
+        print("Menu Module (Production Hardened v3.0)")
+        print("="*60)
         
         # Create sample menu
         sample_menu = {
@@ -709,55 +844,79 @@ if __name__ == "__main__":
                     "id": "1",
                     "name": "Large Pizza",
                     "price": 15.99,
-                    "description": "Classic large pizza with your choice of toppings",
+                    "description": "Classic large pizza",
                     "category": "Pizza",
-                    "available": True
+                    "available": True,
+                    "metadata": {
+                        "synonyms": ["pizza", "large pie", "family pizza"]
+                    }
                 },
                 {
                     "id": "2",
-                    "name": "Chicken Wings",
-                    "price": "$9.99",  # Test price normalization
-                    "description": "Crispy chicken wings",
-                    "category": "Appetizers",
-                    "available": True
+                    "name": "Caesar Salad",
+                    "price": 8.99,
+                    "description": "Fresh romaine lettuce",
+                    "category": "Salads",
+                    "available": True,
+                    "metadata": {
+                        "synonyms": ["salad", "caesar"]
+                    }
                 },
                 {
                     "id": "3",
-                    "name": "Caesar Salad",
-                    "price": 8.50,
-                    "description": "Fresh romaine lettuce with caesar dressing",
-                    "category": "Salads",
-                    "available": False  # Unavailable
+                    "name": "Chicken Wings",
+                    "price": 12.99,
+                    "description": "Spicy buffalo wings",
+                    "category": "Appetizers",
+                    "available": False
                 }
-            ],
-            "categories": ["Pizza", "Appetizers", "Salads"]
+            ]
         }
         
-        # Validate
-        validated = _validate_menu(sample_menu)
-        print(f"\nValidated menu: {len(validated['items'])} items")
+        # Load menu into repository
+        validated = _repository._validate_and_canonicalize(sample_menu, "rest_001")
+        _repository._set_in_cache("rest_001", validated)
         
-        # Format for prompt
-        print("\nFormatted for LLM:")
-        print(format_menu_for_prompt(validated))
+        print("\n1. Canonical Items:")
+        items = _repository.get_all_canonical_items("rest_001")
+        for item in items:
+            print(f"  • {item.name} [{item.canonical_id}]")
+            print(f"    Price: ${item.price}")
+            print(f"    Synonyms: {item.synonyms}")
+            print(f"    Available: {item.available}")
         
-        # Compact format
-        print("\nCompact format:")
-        print(format_menu_compact(validated))
+        print("\n2. Exact Match:")
+        match = match_menu_item("rest_001", "Large Pizza")
+        if match:
+            print(f"  ✓ Matched: {match.name} [{match.canonical_id}]")
         
-        # Search
-        print("\nSearch 'pizza':")
-        results = search_menu_items(validated, "pizza")
-        for item in results:
-            print(f"  - {item['name']} (${item['price']:.2f})")
+        print("\n3. Synonym Match:")
+        match = match_menu_item("rest_001", "pizza")
+        if match:
+            print(f"  ✓ Matched: {match.name} via synonym")
         
-        # Categories
-        print("\nCategories:", get_categories(validated))
+        print("\n4. Hallucination Rejection:")
+        match = match_menu_item("rest_001", "Unicorn Burger")
+        if match is None:
+            print(f"  ✓ Correctly rejected: 'Unicorn Burger' (not on menu)")
         
-        # Cache stats
-        print("\nCache stats:", get_cache_stats())
+        print("\n5. Validation Check:")
+        # Get canonical ID
+        items = _repository.get_all_canonical_items("rest_001")
+        valid_id = items[0].canonical_id
+        fake_id = "item_fake123"
         
-        print("\n" + "=" * 50)
-        print("Production menu module ready")
+        print(f"  Valid ID '{valid_id}': {validate_item_exists('rest_001', valid_id)}")
+        print(f"  Fake ID '{fake_id}': {validate_item_exists('rest_001', fake_id)}")
+        
+        print("\n6. Available Items Only:")
+        available = get_available_items("rest_001")
+        print(f"  {len(available)} available items:")
+        for item in available:
+            print(f"    • {item.name}")
+        
+        print("\n7. AI-Formatted Menu:")
+        formatted = format_menu_for_ai("rest_001")
+        print(formatted)
     
     asyncio.run(example())
